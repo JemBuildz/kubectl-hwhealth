@@ -1,0 +1,452 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Illustrative Canvas mockups for kubectl-hwhealth v0.2.0">
+  <title>kubectl-hwhealth Screenshot Studio</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #090d16;
+      color: #f8fafc;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      min-height: 100vh;
+      margin: 0;
+      padding: 30px 20px 40px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      background:
+        radial-gradient(ellipse at 50% 0%, rgba(14, 116, 144, 0.18), transparent 55%),
+        #090d16;
+    }
+
+    header {
+      width: min(100%, 1200px);
+      margin-bottom: 22px;
+      text-align: center;
+    }
+
+    h1 {
+      margin: 0 0 8px;
+      color: #7dd3fc;
+      font-size: clamp(1.25rem, 3vw, 1.7rem);
+      letter-spacing: 0.01em;
+    }
+
+    header p {
+      margin: 0;
+      color: #a9b6c8;
+      font-size: 0.98rem;
+      line-height: 1.5;
+    }
+
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      gap: 10px;
+      margin: 0 0 18px;
+    }
+
+    button {
+      min-height: 42px;
+      padding: 10px 16px;
+      border: 1px solid #334155;
+      border-radius: 8px;
+      background: #172235;
+      color: #f8fafc;
+      font-family: inherit;
+      font-size: 0.92rem;
+      font-weight: 600;
+      line-height: 1.2;
+      cursor: pointer;
+      transition: background 120ms ease, border-color 120ms ease, transform 120ms ease;
+    }
+
+    button:hover { background: #22324a; }
+    button:focus-visible { outline: 3px solid #38bdf8; outline-offset: 2px; }
+    button:active { transform: translateY(1px); }
+    button[aria-pressed="true"] { background: #075985; border-color: #38bdf8; }
+    button.download { background: #166534; border-color: #4ade80; }
+    button.download:hover { background: #15803d; }
+
+    .canvas-frame {
+      width: min(100%, 1440px);
+      overflow: hidden;
+      border: 1px solid #26364e;
+      border-radius: 14px;
+      background: #0b0f19;
+      box-shadow: 0 24px 70px rgba(0, 0, 0, 0.45);
+    }
+
+    canvas {
+      display: block;
+      width: 100%;
+      height: auto;
+    }
+
+    .note {
+      max-width: 1000px;
+      margin: 15px 0 0;
+      color: #8493a8;
+      font-size: 0.86rem;
+      line-height: 1.5;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>kubectl-hwhealth Screenshot Studio</h1>
+    <p>Canvas previews use sample values only. No shell commands, cluster calls, or hardware reads are performed.</p>
+  </header>
+
+  <nav class="toolbar" aria-label="Screenshot examples">
+    <button id="btnScan" type="button" aria-pressed="true">Read-only scan</button>
+    <button id="btnDryRun" type="button" aria-pressed="false">Simulated dry-run</button>
+    <button id="btnDownload" class="download" type="button">Download 1920 × 1080 PNG</button>
+  </nav>
+
+  <main class="canvas-frame">
+    <canvas id="terminalCanvas" width="1920" height="1080" aria-label="Illustrative terminal mockup for kubectl-hwhealth"></canvas>
+  </main>
+  <p class="note">Illustrative interface preview, not a live capture. Sensor readings, node names, and RAID state below are fictional demo data. The table spacing follows the column-width and three-space padding behavior used by <code>tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)</code>.</p>
+
+  <script>
+    "use strict";
+
+    const WIDTH = 1920;
+    const HEIGHT = 1080;
+    const TABLE_PADDING = 3; // main.go: tabwriter.NewWriter(..., 0, 0, 3, ' ', 0)
+    const canvas = document.getElementById("terminalCanvas");
+    const ctx = canvas.getContext("2d");
+    const buttons = {
+      scan: document.getElementById("btnScan"),
+      dryRun: document.getElementById("btnDryRun"),
+      download: document.getElementById("btnDownload")
+    };
+
+    const colors = {
+      text: "#e2e8f0",
+      muted: "#94a3b8",
+      cyan: "#38bdf8",
+      green: "#4ade80",
+      yellow: "#fbbf24",
+      red: "#f87171",
+      white: "#f8fafc"
+    };
+
+    const sampleNodes = [
+      {
+        name: "k3s-master-1",
+        arch: "amd64",
+        thermal: "UNKNOWN",
+        raid: "UNKNOWN (no authenticated telemetry)",
+        status: "UNKNOWN (uninspected remote node)",
+        statusColor: colors.yellow
+      },
+      {
+        name: "k3s-worker-1",
+        arch: "amd64",
+        thermal: "UNKNOWN",
+        raid: "UNKNOWN (no authenticated telemetry)",
+        status: "UNKNOWN (uninspected remote node)",
+        statusColor: colors.yellow
+      },
+      {
+        name: "k3s-worker-2",
+        arch: "amd64",
+        thermal: "68.0°C (x86_pkg_temp)",
+        raid: "md0 [UU], md1 [U_] DEGRADED",
+        simulatedRaid: "md0 [U_] (SIMULATED DEGRADED)",
+        status: "CRITICAL: RAID DEGRADED",
+        statusColor: colors.red
+      }
+    ];
+
+    const headers = ["NODE", "ARCH", "THERMAL", "RAID ARRAY", "HARDWARE STATUS"];
+    const initialMode = new URLSearchParams(window.location.search).get("mode");
+    let mode = initialMode === "dryrun" ? "dryrun" : "scan";
+
+    function roundRect(context, x, y, width, height, radius) {
+      context.beginPath();
+      context.moveTo(x + radius, y);
+      context.lineTo(x + width - radius, y);
+      context.quadraticCurveTo(x + width, y, x + width, y + radius);
+      context.lineTo(x + width, y + height - radius);
+      context.quadraticCurveTo(x + width, y + height, x + width - radius, y + height);
+      context.lineTo(x + radius, y + height);
+      context.quadraticCurveTo(x, y + height, x, y + height - radius);
+      context.lineTo(x, y + radius);
+      context.quadraticCurveTo(x, y, x + radius, y);
+      context.closePath();
+    }
+
+    function stripAnsi(text) {
+      return String(text).replace(/\x1b\[[0-9;]*m/g, "");
+    }
+
+    // Go tabwriter aligns columns using visible text widths; ANSI color escapes
+    // are not part of the visible cell text. The last column has no right pad.
+    function visibleWidth(text) {
+      return Array.from(stripAnsi(text)).length;
+    }
+
+    function tabwriterWidths(rows) {
+      return headers.map((header, column) => {
+        return Math.max(header.length, ...rows.map((row) => visibleWidth(row.cells[column])));
+      });
+    }
+
+    function formatTabwriterRow(cells, widths, statusColor = colors.text, header = false) {
+      const segments = [];
+      cells.forEach((cell, column) => {
+        const color = header ? colors.muted : (column === cells.length - 1 ? statusColor : colors.text);
+        segments.push({ text: stripAnsi(cell), color });
+        if (column < cells.length - 1) {
+          const spaces = widths[column] - visibleWidth(cell) + TABLE_PADDING;
+          segments.push({ text: " ".repeat(Math.max(0, spaces)), color: colors.text });
+        }
+      });
+      return segments;
+    }
+
+    function textTokens(text) {
+      return String(text).match(/\s+|[^\s]+/gu) || [];
+    }
+
+    // Draw a colored logical line, wrapping at word boundaries. Long individual
+    // tokens are split by Unicode code point so no text can run off the canvas.
+    function drawWrappedSegments(context, segments, x, baselineY, maxWidth, font, lineHeight) {
+      context.font = font;
+      let cursorX = x;
+      let baseline = baselineY;
+      let lineCount = 1;
+
+      const nextLine = () => {
+        baseline += lineHeight;
+        cursorX = x;
+        lineCount += 1;
+      };
+
+      for (const segment of segments) {
+        const color = segment.color || colors.text;
+        for (const token of textTokens(segment.text)) {
+          if (/^\s+$/u.test(token)) {
+            if (cursorX === x) continue;
+            const spaceWidth = context.measureText(" ").width;
+            const numberOfSpaces = Array.from(token).length;
+            for (let i = 0; i < numberOfSpaces; i += 1) {
+              if (cursorX + spaceWidth > x + maxWidth) nextLine();
+              else {
+                context.fillStyle = color;
+                context.fillText(" ", cursorX, baseline);
+                cursorX += spaceWidth;
+              }
+            }
+            continue;
+          }
+
+          const wordWidth = context.measureText(token).width;
+          if (wordWidth <= maxWidth) {
+            if (cursorX > x && cursorX + wordWidth > x + maxWidth) nextLine();
+            context.fillStyle = color;
+            context.fillText(token, cursorX, baseline);
+            cursorX += wordWidth;
+            continue;
+          }
+
+          for (const character of Array.from(token)) {
+            const characterWidth = context.measureText(character).width;
+            if (cursorX > x && cursorX + characterWidth > x + maxWidth) nextLine();
+            context.fillStyle = color;
+            context.fillText(character, cursorX, baseline);
+            cursorX += characterWidth;
+          }
+        }
+      }
+
+      return { nextBaseline: baseline + lineHeight, lineCount };
+    }
+
+    function drawPlain(context, text, x, baselineY, maxWidth, font, color, lineHeight) {
+      return drawWrappedSegments(context, [{ text, color }], x, baselineY, maxWidth, font, lineHeight);
+    }
+
+    function drawPrompt(context, command, x, baselineY, maxWidth, font, lineHeight) {
+      const prompt = "ops@k3s-worker-2:~$ ";
+      return drawWrappedSegments(context, [
+        { text: prompt, color: colors.green },
+        { text: command, color: colors.white }
+      ], x, baselineY, maxWidth, font, lineHeight);
+    }
+
+    function createTableRows() {
+      return sampleNodes.map((node, index) => {
+        const isLocal = index === sampleNodes.length - 1;
+        const raid = isLocal && mode === "dryrun" ? node.simulatedRaid : node.raid;
+        return {
+          cells: [node.name, node.arch, node.thermal, raid, node.status],
+          statusColor: node.statusColor
+        };
+      });
+    }
+
+    function drawTabwriterTable(context, startY, x, maxWidth, font, lineHeight) {
+      const rows = createTableRows();
+      const widths = tabwriterWidths(rows);
+      let y = startY;
+
+      const header = drawWrappedSegments(
+        context,
+        formatTabwriterRow(headers, widths, colors.muted, true),
+        x, y, maxWidth, `bold ${font}`, lineHeight
+      );
+      y = header.nextBaseline + 5;
+
+      for (const row of rows) {
+        const drawn = drawWrappedSegments(
+          context,
+          formatTabwriterRow(row.cells, widths, row.statusColor),
+          x, y, maxWidth, font, lineHeight
+        );
+        y = drawn.nextBaseline + 2;
+      }
+      return y;
+    }
+
+    function syncButtons() {
+      buttons.scan.setAttribute("aria-pressed", String(mode === "scan"));
+      buttons.dryRun.setAttribute("aria-pressed", String(mode === "dryrun"));
+    }
+
+    function drawTerminal() {
+      ctx.clearRect(0, 0, WIDTH, HEIGHT);
+      const background = ctx.createLinearGradient(0, 0, WIDTH, HEIGHT);
+      background.addColorStop(0, "#0f172a");
+      background.addColorStop(1, "#1e1b4b");
+      ctx.fillStyle = background;
+      ctx.fillRect(0, 0, WIDTH, HEIGHT);
+
+      // Visible disclosure stays in the exported PNG so sample telemetry cannot
+      // be mistaken for a live product capture.
+      roundRect(ctx, 80, 28, 380, 42, 18);
+      ctx.fillStyle = "#422006";
+      ctx.fill();
+      ctx.strokeStyle = "#a16207";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      ctx.font = "bold 18px system-ui, sans-serif";
+      ctx.fillStyle = "#fde68a";
+      ctx.textAlign = "center";
+      ctx.fillText("ILLUSTRATIVE SAMPLE · NO LIVE DATA", 270, 56);
+
+      const windowBox = { x: 80, y: 88, width: 1760, height: 930 };
+      ctx.save();
+      ctx.shadowColor = "rgba(0, 0, 0, 0.62)";
+      ctx.shadowBlur = 54;
+      ctx.shadowOffsetY = 22;
+      roundRect(ctx, windowBox.x, windowBox.y, windowBox.width, windowBox.height, 24);
+      ctx.fillStyle = "#0b0f19";
+      ctx.fill();
+      ctx.restore();
+
+      roundRect(ctx, windowBox.x, windowBox.y, windowBox.width, windowBox.height, 24);
+      ctx.strokeStyle = "#334155";
+      ctx.lineWidth = 3;
+      ctx.stroke();
+
+      ctx.save();
+      roundRect(ctx, windowBox.x, windowBox.y, windowBox.width, 68, 24);
+      ctx.clip();
+      ctx.fillStyle = "#161f33";
+      ctx.fillRect(windowBox.x, windowBox.y, windowBox.width, 68);
+      ctx.restore();
+
+      ["#ff5f56", "#ffbd2e", "#27c93f"].forEach((color, index) => {
+        ctx.beginPath();
+        ctx.arc(windowBox.x + 42 + index * 36, windowBox.y + 34, 11, 0, Math.PI * 2);
+        ctx.fillStyle = color;
+        ctx.fill();
+      });
+
+      ctx.textAlign = "center";
+      ctx.font = "600 22px system-ui, sans-serif";
+      ctx.fillStyle = colors.muted;
+      ctx.fillText("bash — ops@k3s-worker-2:~ — kubectl hwhealth v0.2.0", WIDTH / 2, windowBox.y + 43);
+      ctx.textAlign = "left";
+
+      const left = windowBox.x + 54;
+      const maxWidth = windowBox.width - 108;
+      const mono = '22px Consolas, "Liberation Mono", Menlo, Courier, monospace';
+      const monoBold = 'bold 22px Consolas, "Liberation Mono", Menlo, Courier, monospace';
+      const lineHeight = 34;
+      let y = windowBox.y + 124;
+
+      const command = mode === "scan"
+        ? "kubectl hwhealth --context=homelab --node-name=k3s-worker-2"
+        : "kubectl hwhealth --context=homelab --node-name=k3s-worker-2 --simulate-raid-fail --auto-cordon";
+      const commandLine = drawPrompt(ctx, command, left, y, maxWidth, mono, lineHeight);
+      y = commandLine.nextBaseline + 14;
+
+      const banner = drawPlain(
+        ctx,
+        "=== kubectl-hwhealth: Bare-Metal RAID & Thermal Scanner ===",
+        left, y, maxWidth, monoBold, colors.cyan, lineHeight
+      );
+      y = banner.nextBaseline + 17;
+
+      y = drawTabwriterTable(ctx, y, left, maxWidth, mono, lineHeight);
+      y += 18;
+
+      if (mode === "dryrun") {
+        const dryRunNotice = drawPlain(
+          ctx,
+          "[DRY-RUN] Simulation is always non-mutating; no kubectl commands or webhook requests will be made.",
+          left, y, maxWidth, mono, colors.yellow, lineHeight
+        );
+        y = dryRunNotice.nextBaseline + 2;
+        const wouldCordon = drawPlain(
+          ctx,
+          '[DRY-RUN] Would cordon verified local node "k3s-worker-2".',
+          left, y, maxWidth, mono, colors.text, lineHeight
+        );
+        y = wouldCordon.nextBaseline + 14;
+      } else {
+        y += 4;
+      }
+
+      const echoLine = drawPrompt(ctx, "echo $?", left, y, maxWidth, mono, lineHeight);
+      y = echoLine.nextBaseline;
+      drawPlain(ctx, "2", left, y, maxWidth, mono, colors.text, lineHeight);
+    }
+
+    function setMode(nextMode) {
+      mode = nextMode;
+      syncButtons();
+      drawTerminal();
+    }
+
+    function downloadPng() {
+      const link = document.createElement("a");
+      link.download = `kubectl-hwhealth-${mode}-sample.png`;
+      link.href = canvas.toDataURL("image/png");
+      link.click();
+    }
+
+    buttons.scan.addEventListener("click", () => setMode("scan"));
+    buttons.dryRun.addEventListener("click", () => setMode("dryrun"));
+    buttons.download.addEventListener("click", downloadPng);
+
+    syncButtons();
+    drawTerminal();
+  </script>
+</body>
+</html>
