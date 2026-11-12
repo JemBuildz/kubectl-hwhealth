@@ -19,6 +19,7 @@ A small Go kubectl plugin for Linux software RAID and CPU thermal status—with 
 
 - [Why kubectl-hwhealth](#why-kubectl-hwhealth)
 - [How it works](#how-it-works)
+- [Demo previews](#demo-previews)
 - [Quick start](#quick-start)
 - [Install and verify](#install-and-verify)
 - [Commands and options](#commands-and-options)
@@ -62,6 +63,15 @@ flowchart LR
 By default, the plugin uses the host name and matches it against a Kubernetes node name or `kubernetes.io/hostname` label. If your host and node names differ, supply `--node-name`; with that override, the name must match a Kubernetes node exactly. Automated actions require exactly one local-node match. If the cluster cannot be queried or the match is not unique, the program fails closed and will not remediate.
 
 For multi-node clusters, run the command on each Linux node you want to inspect. This release does not authenticate or consume remote hardware annotations.
+
+## Demo previews
+
+These are illustrative Canvas mockups made with the [Screenshot Studio](assets/demo/screenshot-studio.html). Node names, sensor readings, and RAID states are fictional sample data; the images are not live captures and no cluster or hardware was queried. The second preview shows the non-mutating `--simulate-raid-fail --auto-cordon` path.
+
+<p align="center">
+  <a href="assets/demo/read-only-scan-preview.png"><img src="assets/demo/read-only-scan-preview.png" alt="Illustrative read-only scan showing unknown remote nodes and a local degraded RAID finding" width="49%"></a>
+  <a href="assets/demo/simulated-dry-run-preview.png"><img src="assets/demo/simulated-dry-run-preview.png" alt="Illustrative dry-run simulation showing a would-cordon message without cluster mutation" width="49%"></a>
+</p>
 
 ## Quick start
 
