@@ -1,3 +1,5 @@
+# kubectl-hwhealth: Kubernetes Node Hardware Health Scanner
+
 ![kubectl-hwhealth banner](assets/kubectl-hwhealth-horizontal-banner.webp)
 
 <p align="center">
@@ -23,6 +25,7 @@ A small Go scanner for Linux software RAID and CPU thermal status.</p>
 - [Options and exit codes](#options-and-exit-codes)
 - [Go package](#go-package)
 - [Safety](#safety)
+- [FAQ](#faq)
 - [Development](#development)
 - [License](#license)
 
@@ -138,6 +141,44 @@ go build .
 ```
 
 The release workflow runs tests and `go vet` on pushes and pull requests. Future published scanner-only releases build Linux amd64/arm64 binaries, checksums, and provenance attestations.
+
+## FAQ
+
+### What hardware does kubectl-hwhealth check?
+
+It reads Linux software RAID status from `/proc/mdstat` and CPU/package thermal readings from recognized zones under `/sys/class/thermal` on the host where the command runs.
+
+### Is the public scanner read-only?
+
+Yes. The current public `main` reads local hardware files and may run `kubectl get nodes -o json` to associate local readings with a node. It does not cordon or drain nodes, change Kubernetes resources, or send webhook requests.
+
+### Does it collect hardware telemetry from every node remotely?
+
+No. Run it on each Linux host whose hardware you want to inspect. The Kubernetes node list is used for identity matching only; uninspected, unmatched, or ambiguous nodes remain `UNKNOWN`.
+
+### What Kubernetes permissions are required?
+
+For node association, the active Kubernetes identity needs permission to list nodes. The public scanner requires no write permissions. If the `kubectl` query fails, it still reports the local host and indicates that cluster association was unavailable.
+
+### Which operating systems and CPU architectures are supported?
+
+The scanner is intended to run on Linux and the release workflow builds Linux `amd64` and `arm64` binaries. Building from source requires Go 1.23 or newer.
+
+### How do I install the current scanner-only version?
+
+There is not yet a scanner-only binary release; build from the current `main` branch using [Build and run](#build-and-run). The `v0.2.0` release predates the split and is not a build of the current scanner-only source.
+
+### What does `--simulate-raid-fail` do?
+
+It substitutes a simulated degraded RAID result so you can preview scanner output. It performs no Kubernetes action and sends no alert.
+
+### Are Pro remediation features included in this repository?
+
+No. The current public source and scanner package contain only read-only diagnostics. Commercial Pro remediation is maintained separately.
+
+### Can I call the scanner from another Go program?
+
+Yes. Import `github.com/jembuildz/kubectl-hwhealth/pkg/health` and call `health.Scan`; see the [Go package example](#go-package).
 
 ## License
 
