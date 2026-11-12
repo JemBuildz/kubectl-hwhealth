@@ -1,76 +1,158 @@
 ![kubectl-hwhealth banner](assets/kubectl-hwhealth-horizontal-banner.webp)
 
-A small Go `kubectl` plugin that checks Linux software RAID status from `/proc/mdstat` and CPU/package temperatures from `/sys/class/thermal` on the machine where it runs.
+<p align="center">
+  <a href="https://github.com/JemBuildz/kubectl-hwhealth/actions/workflows/release.yml"><img alt="Main CI" src="https://img.shields.io/github/actions/workflow/status/JemBuildz/kubectl-hwhealth/release.yml?branch=main&label=CI&style=flat-square&logo=githubactions&logoColor=white"></a>
+  <a href="https://github.com/JemBuildz/kubectl-hwhealth/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/JemBuildz/kubectl-hwhealth?display_name=tag&style=flat-square"></a>
+  <a href="https://github.com/JemBuildz/kubectl-hwhealth/releases"><img alt="Release downloads" src="https://img.shields.io/github/downloads/JemBuildz/kubectl-hwhealth/total?style=flat-square"></a>
+  <img alt="Go version" src="https://img.shields.io/github/go-mod/go-version/JemBuildz/kubectl-hwhealth?style=flat-square&logo=go">
+  <img alt="Supported release platforms" src="https://img.shields.io/badge/platform-Linux%20amd64%20%7C%20arm64-2478C7?style=flat-square">
+  <a href="https://github.com/JemBuildz/kubectl-hwhealth"><img alt="GitHub stars" src="https://img.shields.io/github/stars/JemBuildz/kubectl-hwhealth?style=flat-square&logo=github"></a>
+</p>
 
-## Scope and node identity
+<p align="center"><strong>Local-first hardware health for Kubernetes nodes.</strong><br>
+A small Go kubectl plugin for Linux software RAID and CPU thermal status—with node identity and safe failure handling built in.</p>
 
-This is a **local-node scanner**, not a cluster-wide telemetry collector. It reads hardware from the local host and associates that data with exactly one Kubernetes node, matched by node name or the `kubernetes.io/hostname` label. If the match is missing or ambiguous, the reading is not eligible for automated remediation. Remote nodes are reported as unknown because this version does not authenticate remote telemetry. Run the scanner locally on each Linux node for per-node checks.
+> [!IMPORTANT]
+> **Run it on the Linux host whose hardware you want to inspect.** The plugin reads that host’s sensors; it is not a remote agent or cluster-wide telemetry system. Uninspected nodes remain `UNKNOWN` rather than inheriting another machine’s readings.
 
-When the hostname does not match the Kubernetes node name, provide an explicit mapping:
+## Contents
 
-```bash
-kubectl hwhealth --node-name=k3s-worker-2
+- [Why kubectl-hwhealth](#why-kubectl-hwhealth)
+- [How it works](#how-it-works)
+- [Quick start](#quick-start)
+- [Install and verify](#install-and-verify)
+- [Commands and options](#commands-and-options)
+- [Safety model](#safety-model)
+- [Development](#development)
+- [License](#license)
+
+## Why kubectl-hwhealth
+
+Kubernetes can report node readiness and workload status, but a standard Kubernetes node view does not expose Linux `mdraid` member state or host CPU thermal-zone readings. `kubectl-hwhealth` adds a focused, one-shot check for those signals on the Linux machine where it runs.
+
+| Signal | What it checks | How missing or ambiguous data is handled |
+|---|---|---|
+| Software RAID | Parses `/proc/mdstat`, evaluates multiple `md*` arrays, and reports the most severe observed state | Unreadable or incomplete state is `UNKNOWN`, not assumed healthy |
+| CPU thermals | Reads recognized CPU/package zones under `/sys/class/thermal` | Missing, unreadable, or invalid readings are `UNKNOWN`; ambient-only sensors are not substituted |
+| Kubernetes node identity | Maps local readings to a uniquely matching node name or hostname label | Remote, unmatched, or ambiguous nodes are not actionable |
+
+Highlights:
+
+- Read-only scan by default; no background service or telemetry publishing.
+- `--warn-temp` threshold is configurable (default: **75°C**).
+- Simulation mode is always dry-run, even when remediation flags are supplied.
+- Optional cordon, drain, and Slack/Discord alert paths are guarded by explicit context and node checks.
+- Linux release binaries for **amd64** and **arm64**, with SHA-256 checksums and GitHub provenance attestations.
+
+## How it works
+
+```mermaid
+flowchart LR
+    host["Linux host running kubectl-hwhealth"] --> raid["/proc/mdstat"]
+    host --> temp["/sys/class/thermal"]
+    host --> identity["hostname or --node-name"]
+    identity --> kube["kubectl get nodes"]
+    raid --> report["Local-node health report"]
+    temp --> report
+    kube --> report
+    report --> known["Unique local match: may be actionable"]
+    report --> unknown["Other or ambiguous nodes: UNKNOWN"]
 ```
 
-The explicit name is an operator assertion; verify it before enabling automated actions.
+By default, the plugin uses the host name and matches it against a Kubernetes node name or `kubernetes.io/hostname` label. If your host and node names differ, supply `--node-name`; with that override, the name must match a Kubernetes node exactly. Automated actions require exactly one local-node match. If the cluster cannot be queried or the match is not unique, the program fails closed and will not remediate.
 
-## Install
+For multi-node clusters, run the command on each Linux node you want to inspect. This release does not authenticate or consume remote hardware annotations.
 
-Download a release binary and its SHA-256 file from the [Releases page](https://github.com/JemBuildz/kubectl-hwhealth/releases/latest). For Linux amd64:
+## Quick start
+
+Run a read-only scan from the Linux node being checked:
+
+```bash
+kubectl hwhealth --context homelab --node-name k3s-worker-2
+```
+
+`--context` is optional for a read-only scan; it is shown here to make the target cluster explicit. If the local host name already matches the Kubernetes node name, `--node-name` can be omitted.
+
+Safely exercise the failure path and preview a would-be action:
+
+```bash
+kubectl hwhealth \
+  --context homelab \
+  --node-name k3s-worker-2 \
+  --simulate-raid-fail \
+  --auto-cordon
+```
+
+Simulation makes no Kubernetes mutation and sends no webhook request. It is safe for demonstrating the action flow; it does not validate a production license.
+
+## Install and verify
+
+Download the current Linux binary from the [v0.2.0 release](https://github.com/JemBuildz/kubectl-hwhealth/releases/tag/v0.2.0). Select `amd64` or `arm64` for the Linux host:
 
 ```bash
 set -euo pipefail
-curl -fsSLO https://github.com/JemBuildz/kubectl-hwhealth/releases/latest/download/kubectl-hwhealth-linux-amd64
-curl -fsSLO https://github.com/JemBuildz/kubectl-hwhealth/releases/latest/download/checksums.txt
-grep -F 'kubectl-hwhealth-linux-amd64' checksums.txt | sha256sum -c -
-gh attestation verify kubectl-hwhealth-linux-amd64 --repo JemBuildz/kubectl-hwhealth --signer-workflow JemBuildz/kubectl-hwhealth/.github/workflows/release.yml
-chmod +x kubectl-hwhealth-linux-amd64
-sudo install -m 0755 kubectl-hwhealth-linux-amd64 /usr/local/bin/kubectl-hwhealth
+ARCH=amd64 # change to arm64 on a Linux ARM64 host
+ASSET="kubectl-hwhealth-linux-${ARCH}"
+BASE_URL="https://github.com/JemBuildz/kubectl-hwhealth/releases/latest/download"
+
+curl -fsSLo "$ASSET" "$BASE_URL/$ASSET"
+curl -fsSLo checksums.txt "$BASE_URL/checksums.txt"
+grep -F "  $ASSET" checksums.txt | sha256sum -c -
+
+gh attestation verify "$ASSET" \
+  --repo JemBuildz/kubectl-hwhealth \
+  --signer-workflow JemBuildz/kubectl-hwhealth/.github/workflows/release.yml
+
+chmod +x "$ASSET"
+sudo install -m 0755 "$ASSET" /usr/local/bin/kubectl-hwhealth
 ```
 
-The checksum detects accidental corruption. Since the checksum file is distributed with the binaries, it alone does **not** authenticate the publisher or protect against replacement of both files. The `gh attestation verify` command checks the binary’s GitHub artifact provenance against the expected repository; install GitHub CLI if it is not already available.
+The checksum helps detect corruption; because it is distributed with the binary, it is not an independent publisher-authentication mechanism. The `gh attestation verify` step verifies GitHub build provenance for the expected repository and workflow. It requires GitHub CLI with attestation support.
 
-Run a read-only scan:
+See the [release page](https://github.com/JemBuildz/kubectl-hwhealth/releases) for assets, checksums, and provenance.
 
-```bash
-kubectl hwhealth
-```
+## Commands and options
 
-The scanner reports missing or unreadable sensor data as `UNKNOWN`; it does not substitute a fabricated temperature. Non-Linux hosts cannot read Linux RAID status and are not suitable for hardware scanning.
+| Option | Purpose |
+|---|---|
+| `--context NAME` | Selects the Kubernetes context. Required with `--auto-cordon`, `--auto-drain`, or `--webhook-url`. |
+| `--node-name NAME` | Explicit Kubernetes node name for this host; when set, it must match exactly. |
+| `--warn-temp CELSIUS` | CPU/package warning threshold; default `75`. Must be greater than 0 and less than 135. |
+| `--simulate-raid-fail` | Simulates a degraded RAID finding. Any requested action remains dry-run. |
+| `--auto-cordon` | Cordon the uniquely matched local node after a confirmed failure. |
+| `--auto-drain` | Drain the uniquely matched local node after a confirmed failure. Cannot be combined with `--auto-cordon`. |
+| `--webhook-url URL` | Send a failure alert to an approved Slack or Discord HTTPS webhook. |
+| `--license-key KEY` | Provide a signed Pro key; alternatively set `HWHEALTH_LICENSE_KEY`. Required for live actions, not simulation. |
 
-## Failure simulation
+Run `kubectl hwhealth --help` for the CLI’s current flag descriptions.
 
-Simulation is always dry-run, regardless of license key. It does not run `kubectl` mutations or send webhook requests:
+## Safety model
 
-```bash
-kubectl hwhealth --context=homelab --node-name=k3s-worker-2 --simulate-raid-fail --auto-drain
-```
+**The default path is observational.** The command reads local hardware files and queries Kubernetes nodes; it does not patch nodes, evict pods, or send alerts unless an action is explicitly requested.
 
-A simulated failure with no remediation flag only displays the simulated finding.
+Before any live action, the program requires an explicit Kubernetes context, a uniquely matched local node, and a valid Ed25519-signed Pro key built against the configured public key. The key is a feature gate, not an authorization boundary—Kubernetes permissions still come from the active kubeconfig and RBAC identity. Use a dedicated identity with only the access required for the chosen operation.
 
-## Optional remediation
+- `--auto-cordon` prevents new pods from scheduling on the selected node; it does not evict existing pods.
+- `--auto-drain` runs `kubectl drain --ignore-daemonsets --timeout=60s`. It does **not** pass `--delete-emptydir-data`; drain may fail when pods use local ephemeral data, leaving that decision to an operator.
+- Webhooks are restricted to HTTPS Slack and Discord endpoints on port 443. Hostnames are allowlisted, DNS answers are checked for private/special-use addresses, redirects are disabled, and non-2xx responses fail the command.
+- Missing sensor or RAID data is reported as unknown; unknown or ambiguous nodes are never treated as confirmed hardware failures.
 
-Live actions require a valid Ed25519-signed key and a binary built with the corresponding public key. The private signing key must stay offline and must never be included in the source, binary, workflow, or repository variables. The public key is not secret; configure it as the repository variable `HWHEALTH_ED25519_PUBKEY_HEX` before publishing a release. Until that variable is set, release builds intentionally fail rather than shipping a binary that cannot validate production keys.
-
-The license check is only a commercial feature gate. Kubernetes authorization still comes from the kubeconfig/RBAC identity. Any requested webhook or remediation action requires an explicit `--context` so the target cluster is visible in the command. For example:
-
-```bash
-kubectl hwhealth --context=homelab --node-name=k3s-worker-2 --auto-cordon --license-key="$HWHEALTH_LICENSE_KEY"
-```
-
-Use a dedicated identity and grant only the permissions required for the selected operation. Read-only scanning does not require node patch permission. Cordon and drain are cluster-changing actions; do not grant broad cluster permissions to an unattended process without reviewing the effect.
-
-`--auto-cordon` prevents new pods from being scheduled on the matched node; it does not evict existing pods. `--auto-drain` runs `kubectl drain --ignore-daemonsets --timeout=60s`, which evicts eligible pods and respects PodDisruptionBudgets. It deliberately does not pass `--delete-emptydir-data`; drain can fail when a pod uses local ephemeral data, and an operator must decide how to handle that case. A drain is disruptive and should be enabled only after validating the node mapping and workload disruption policies.
-
-Webhook URLs are restricted to HTTPS Slack and Discord endpoints. DNS answers are checked at connection time and private/special-use addresses are rejected; redirects are disabled and HTTP status codes checked. Protect webhook URLs because they contain credentials.
+The release workflow runs tests and `go vet` on pushes, pull requests, and release builds. Build/test jobs use read-only repository permissions; a separate publisher job receives release-write permissions to attach binaries and attestations.
 
 ## Development
 
-Run tests and static checks with Go 1.23 or newer:
+Requires Go 1.23 or newer.
 
 ```bash
+git clone https://github.com/JemBuildz/kubectl-hwhealth.git
+cd kubectl-hwhealth
 go test ./...
 go vet ./...
+go build .
 ```
 
-The release workflow runs checks on pushes, pull requests, and release builds. It publishes Linux amd64 and arm64 binaries only. Build/test jobs have read-only repository permissions. Only the isolated release-publisher job receives release write permission. Workflow actions are pinned to full commit SHAs, and the publisher creates GitHub artifact attestations.
+Contributions and bug reports are welcome through [GitHub Issues](https://github.com/JemBuildz/kubectl-hwhealth/issues) and pull requests. Please include reproducible hardware/OS details for sensor or RAID parsing reports, and never include real webhook URLs or private license-signing keys in issues.
+
+## License
+
+There is currently no `LICENSE` file in the repository. Do not assume the code is available under an open-source license; ask the maintainer before reusing or redistributing it.
