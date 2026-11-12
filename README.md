@@ -14,7 +14,7 @@
 A small Go scanner for Linux software RAID and CPU thermal status.</p>
 
 > [!IMPORTANT]
-> **The current `main` branch contains only the read-only scanner.** The existing `v0.2.0` tag and release predate this split and remain unchanged; they contain the earlier Pro-capable source and binaries. They are not builds of this scanner-only branch. No new scanner-only release is being published as part of this change, so build from the current source below.
+> **The current `main` branch and v0.2.1 release contain only the read-only scanner.** v0.2.1 is the first scanner-only binary release. The earlier `v0.2.0` tag and release predate the split and remain unchanged; they contain the pre-split source and binaries. Do not use v0.2.0 as the scanner-only release.
 
 ## Contents
 
@@ -39,7 +39,7 @@ Kubernetes reports node and workload state, but does not expose Linux `mdraid` m
 | CPU thermals | Recognized CPU/package zones under `/sys/class/thermal` | Missing, unreadable, invalid, or ambient-only readings are `UNKNOWN` |
 | Node identity | Host name or `--node-name`, matched against Kubernetes node name/hostname label | Remote, unmatched, or ambiguous nodes remain `UNKNOWN` |
 
-The warning threshold is configurable with `--warn-temp` (default **75°C**). Linux binaries are built for **amd64** and **arm64**; future tagged releases will include SHA-256 checksums and GitHub provenance attestations.
+The warning threshold is configurable with `--warn-temp` (default **75°C**). The v0.2.1 release provides Linux **amd64** and **arm64** binaries, SHA-256 checksums, and GitHub provenance attestations.
 
 ## How it works
 
@@ -66,7 +66,40 @@ These are illustrative Canvas mockups made with the [Screenshot Studio](assets/d
 
 ## Build and run
 
-There is not yet a scanner-only binary release. Build the current `main` branch with Go 1.23 or newer:
+### Install a Linux release binary
+
+Download v0.2.1 for the Linux host architecture, then verify its checksum and GitHub provenance before installing:
+
+```bash
+set -euo pipefail
+ARCH=amd64 # use arm64 on a Linux ARM64 host
+ASSET="kubectl-hwhealth-linux-${ARCH}"
+BASE_URL="https://github.com/JemBuildz/kubectl-hwhealth/releases/download/v0.2.1"
+
+curl -fsSLo "$ASSET" "$BASE_URL/$ASSET"
+curl -fsSLo checksums.txt "$BASE_URL/checksums.txt"
+grep -F "  $ASSET" checksums.txt | sha256sum -c -
+gh attestation verify "$ASSET" \
+  --repo JemBuildz/kubectl-hwhealth \
+  --signer-workflow JemBuildz/kubectl-hwhealth/.github/workflows/release.yml
+
+chmod +x "$ASSET"
+sudo install -m 0755 "$ASSET" /usr/local/bin/kubectl-hwhealth
+```
+
+The checksum detects corruption; because it is distributed with the binary, it is not independent publisher authentication. Provenance verification checks the release workflow identity and requires GitHub CLI with attestation support. See the [v0.2.1 release](https://github.com/JemBuildz/kubectl-hwhealth/releases/tag/v0.2.1) for assets and details.
+
+### Install with `go install`
+
+With Go 1.23 or newer, install the tagged scanner release with:
+
+```bash
+go install github.com/jembuildz/kubectl-hwhealth@v0.2.1
+```
+
+Ensure `$(go env GOPATH)/bin` is on your `PATH` so `kubectl` can find the `kubectl-hwhealth` plugin.
+
+### Build from source
 
 ```bash
 git clone https://github.com/JemBuildz/kubectl-hwhealth.git
@@ -140,7 +173,7 @@ go vet ./...
 go build .
 ```
 
-The release workflow runs tests and `go vet` on pushes and pull requests. Future published scanner-only releases build Linux amd64/arm64 binaries, checksums, and provenance attestations.
+The release workflow runs tests and `go vet` on pushes and pull requests. The v0.2.1 scanner-only release provides Linux amd64/arm64 binaries, SHA-256 checksums, and GitHub provenance attestations.
 
 ## FAQ
 
@@ -166,7 +199,7 @@ The scanner is intended to run on Linux and the release workflow builds Linux `a
 
 ### How do I install the current scanner-only version?
 
-There is not yet a scanner-only binary release; build from the current `main` branch using [Build and run](#build-and-run). The `v0.2.0` release predates the split and is not a build of the current scanner-only source.
+Install the Linux binary from the [v0.2.1 release](https://github.com/JemBuildz/kubectl-hwhealth/releases/tag/v0.2.1), or use `go install github.com/jembuildz/kubectl-hwhealth@v0.2.1`. The `v0.2.0` release predates the split and is not a build of the current scanner-only source.
 
 ### What does `--simulate-raid-fail` do?
 
@@ -182,4 +215,4 @@ Yes. Import `github.com/jembuildz/kubectl-hwhealth/pkg/health` and call `health.
 
 ## License
 
-The scanner-only source in the current public branch is licensed under the MIT License; see [`LICENSE`](LICENSE). The historical `v0.2.0` tag and release predate the split and are not covered by the license added to this scanner-only snapshot. That tag and release have been left unchanged.
+The scanner-only source in the current public branch and the v0.2.1 release are licensed under the MIT License; see [`LICENSE`](LICENSE). The historical `v0.2.0` tag and release predate the split and are not covered by the license added to this scanner-only snapshot. That tag and release have been left unchanged.
