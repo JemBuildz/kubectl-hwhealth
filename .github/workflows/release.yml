@@ -35,24 +35,10 @@ jobs:
           go test ./...
 
       - name: Build binaries and checksums
-        env:
-          LICENSE_PUBKEY_HEX: ${{ vars.HWHEALTH_ED25519_PUBKEY_HEX }}
         run: |
           set -euo pipefail
-          if [[ -n "$LICENSE_PUBKEY_HEX" && ! "$LICENSE_PUBKEY_HEX" =~ ^[0-9a-fA-F]{64}$ ]]; then
-            echo "HWHEALTH_ED25519_PUBKEY_HEX must be exactly 64 hexadecimal characters" >&2
-            exit 1
-          fi
-          if [[ "$GITHUB_EVENT_NAME" == "release" && -z "$LICENSE_PUBKEY_HEX" ]]; then
-            echo "Set the public repository variable HWHEALTH_ED25519_PUBKEY_HEX before publishing a release" >&2
-            exit 1
-          fi
-
           mkdir -p dist
           ldflags='-s -w'
-          if [[ -n "$LICENSE_PUBKEY_HEX" ]]; then
-            ldflags="$ldflags -X main.ed25519PubKeyHex=$LICENSE_PUBKEY_HEX"
-          fi
           GOOS=linux GOARCH=amd64 go build -ldflags="$ldflags" -o dist/kubectl-hwhealth-linux-amd64 .
           GOOS=linux GOARCH=arm64 go build -ldflags="$ldflags" -o dist/kubectl-hwhealth-linux-arm64 .
           (cd dist && sha256sum kubectl-hwhealth-* > checksums.txt)

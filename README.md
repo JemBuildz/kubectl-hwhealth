@@ -2,167 +2,143 @@
 
 <p align="center">
   <a href="https://github.com/JemBuildz/kubectl-hwhealth/actions/workflows/release.yml"><img alt="Main CI" src="https://img.shields.io/github/actions/workflow/status/JemBuildz/kubectl-hwhealth/release.yml?branch=main&label=CI&style=flat-square&logo=githubactions&logoColor=white"></a>
-  <a href="https://github.com/JemBuildz/kubectl-hwhealth/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/JemBuildz/kubectl-hwhealth?display_name=tag&style=flat-square"></a>
-  <a href="https://github.com/JemBuildz/kubectl-hwhealth/releases"><img alt="Release downloads" src="https://img.shields.io/github/downloads/JemBuildz/kubectl-hwhealth/total?style=flat-square"></a>
+  <a href="LICENSE"><img alt="MIT license for scanner core" src="https://img.shields.io/badge/license-MIT%20(scanner%20core)-blue?style=flat-square"></a>
   <img alt="Go version" src="https://img.shields.io/github/go-mod/go-version/JemBuildz/kubectl-hwhealth?style=flat-square&logo=go">
   <img alt="Supported release platforms" src="https://img.shields.io/badge/platform-Linux%20amd64%20%7C%20arm64-2478C7?style=flat-square">
   <a href="https://github.com/JemBuildz/kubectl-hwhealth"><img alt="GitHub stars" src="https://img.shields.io/github/stars/JemBuildz/kubectl-hwhealth?style=flat-square&logo=github"></a>
 </p>
 
-<p align="center"><strong>Local-first hardware health for Kubernetes nodes.</strong><br>
-A small Go kubectl plugin for Linux software RAID and CPU thermal status—with node identity and safe failure handling built in.</p>
+<p align="center"><strong>Read-only, local-first hardware health for Kubernetes nodes.</strong><br>
+A small Go scanner for Linux software RAID and CPU thermal status.</p>
 
 > [!IMPORTANT]
-> **Run it on the Linux host whose hardware you want to inspect.** The plugin reads that host’s sensors; it is not a remote agent or cluster-wide telemetry system. Uninspected nodes remain `UNKNOWN` rather than inheriting another machine’s readings.
+> **The current `main` branch contains only the read-only scanner.** The existing `v0.2.0` tag and release predate this split and remain unchanged; they contain the earlier Pro-capable source and binaries. They are not builds of this scanner-only branch. No new scanner-only release is being published as part of this change, so build from the current source below.
 
 ## Contents
 
-- [Why kubectl-hwhealth](#why-kubectl-hwhealth)
+- [What it checks](#what-it-checks)
 - [How it works](#how-it-works)
 - [Demo previews](#demo-previews)
-- [Quick start](#quick-start)
-- [Install and verify](#install-and-verify)
-- [Commands and options](#commands-and-options)
-- [Safety model](#safety-model)
+- [Build and run](#build-and-run)
+- [Options and exit codes](#options-and-exit-codes)
+- [Go package](#go-package)
+- [Safety](#safety)
 - [Development](#development)
 - [License](#license)
 
-## Why kubectl-hwhealth
+## What it checks
 
-Kubernetes can report node readiness and workload status, but a standard Kubernetes node view does not expose Linux `mdraid` member state or host CPU thermal-zone readings. `kubectl-hwhealth` adds a focused, one-shot check for those signals on the Linux machine where it runs.
+Kubernetes reports node and workload state, but does not expose Linux `mdraid` member state or host CPU thermal-zone readings. Run this one-shot scanner on the Linux host whose hardware you want to inspect.
 
-| Signal | What it checks | How missing or ambiguous data is handled |
+| Signal | Source | Missing or ambiguous data |
 |---|---|---|
-| Software RAID | Parses `/proc/mdstat`, evaluates multiple `md*` arrays, and reports the most severe observed state | Unreadable or incomplete state is `UNKNOWN`, not assumed healthy |
-| CPU thermals | Reads recognized CPU/package zones under `/sys/class/thermal` | Missing, unreadable, or invalid readings are `UNKNOWN`; ambient-only sensors are not substituted |
-| Kubernetes node identity | Maps local readings to a uniquely matching node name or hostname label | Remote, unmatched, or ambiguous nodes are not actionable |
+| Software RAID | `/proc/mdstat`; evaluates multiple `md*` arrays | Unreadable or incomplete state is `UNKNOWN`, not assumed healthy |
+| CPU thermals | Recognized CPU/package zones under `/sys/class/thermal` | Missing, unreadable, invalid, or ambient-only readings are `UNKNOWN` |
+| Node identity | Host name or `--node-name`, matched against Kubernetes node name/hostname label | Remote, unmatched, or ambiguous nodes remain `UNKNOWN` |
 
-Highlights:
-
-- Read-only scan by default; no background service or telemetry publishing.
-- `--warn-temp` threshold is configurable (default: **75°C**).
-- Simulation mode is always dry-run, even when remediation flags are supplied.
-- Optional cordon, drain, and Slack/Discord alert paths are guarded by explicit context and node checks.
-- Linux release binaries for **amd64** and **arm64**, with SHA-256 checksums and GitHub provenance attestations.
+The warning threshold is configurable with `--warn-temp` (default **75°C**). Linux binaries are built for **amd64** and **arm64**; future tagged releases will include SHA-256 checksums and GitHub provenance attestations.
 
 ## How it works
 
 ```mermaid
 flowchart LR
-    host["Linux host running kubectl-hwhealth"] --> raid["/proc/mdstat"]
+    host["Linux host running scanner"] --> raid["/proc/mdstat"]
     host --> temp["/sys/class/thermal"]
-    host --> identity["hostname or --node-name"]
-    identity --> kube["kubectl get nodes"]
-    raid --> report["Local-node health report"]
+    identity["hostname or --node-name"] --> kube["read-only kubectl get nodes"]
+    raid --> report["Hardware health report"]
     temp --> report
     kube --> report
-    report --> known["Unique local match: may be actionable"]
-    report --> unknown["Other or ambiguous nodes: UNKNOWN"]
 ```
 
-By default, the plugin uses the host name and matches it against a Kubernetes node name or `kubernetes.io/hostname` label. If your host and node names differ, supply `--node-name`; with that override, the name must match a Kubernetes node exactly. Automated actions require exactly one local-node match. If the cluster cannot be queried or the match is not unique, the program fails closed and will not remediate.
-
-For multi-node clusters, run the command on each Linux node you want to inspect. This release does not authenticate or consume remote hardware annotations.
+By default, the scanner uses the host name and matches it against a Kubernetes node name or `kubernetes.io/hostname` label. If the host and node names differ, pass `--node-name`; an explicit name must match exactly. Local readings are associated with a Kubernetes node only when the identity match is unique. The scanner never treats another node's missing telemetry as healthy.
 
 ## Demo previews
 
-These are illustrative Canvas mockups made with the [Screenshot Studio](assets/demo/screenshot-studio.html). Node names, sensor readings, and RAID states are fictional sample data; the images are not live captures and no cluster or hardware was queried. The second preview shows the non-mutating `--simulate-raid-fail --auto-cordon` path.
+These are illustrative Canvas mockups made with the [Screenshot Studio](assets/demo/screenshot-studio.html). The names and readings are fictional; the images are not live captures. The second image is a mockup of the separate commercial Pro product and **does not represent functionality in this public scanner**.
 
 <p align="center">
-  <a href="assets/demo/read-only-scan-preview.png"><img src="assets/demo/read-only-scan-preview.png" alt="Illustrative read-only scan showing unknown remote nodes and a local degraded RAID finding" width="49%"></a>
-  <a href="assets/demo/simulated-dry-run-preview.png"><img src="assets/demo/simulated-dry-run-preview.png" alt="Illustrative dry-run simulation showing a would-cordon message without cluster mutation" width="49%"></a>
+  <a href="assets/demo/read-only-scan-preview.png"><img src="assets/demo/read-only-scan-preview.png" alt="Illustrative read-only scan with fictional local and remote node data" width="49%"></a>
+  <a href="assets/demo/simulated-dry-run-preview.png"><img src="assets/demo/simulated-dry-run-preview.png" alt="Illustrative mockup of the separate Pro dry-run product; not included in the public scanner" width="49%"></a>
 </p>
 
-## Quick start
+## Build and run
 
-Run a read-only scan from the Linux node being checked:
-
-```bash
-kubectl hwhealth --context homelab --node-name k3s-worker-2
-```
-
-`--context` is optional for a read-only scan; it is shown here to make the target cluster explicit. If the local host name already matches the Kubernetes node name, `--node-name` can be omitted.
-
-Safely exercise the failure path and preview a would-be action:
+There is not yet a scanner-only binary release. Build the current `main` branch with Go 1.23 or newer:
 
 ```bash
-kubectl hwhealth \
-  --context homelab \
-  --node-name k3s-worker-2 \
-  --simulate-raid-fail \
-  --auto-cordon
+git clone https://github.com/JemBuildz/kubectl-hwhealth.git
+cd kubectl-hwhealth
+go test ./...
+go build -o kubectl-hwhealth .
+sudo install -m 0755 kubectl-hwhealth /usr/local/bin/kubectl-hwhealth
 ```
 
-Simulation makes no Kubernetes mutation and sends no webhook request. It is safe for demonstrating the action flow; it does not validate a production license.
-
-## Install and verify
-
-Download the current Linux binary from the [v0.2.0 release](https://github.com/JemBuildz/kubectl-hwhealth/releases/tag/v0.2.0). Select `amd64` or `arm64` for the Linux host:
+With `kubectl` configured for the intended cluster, run the plugin from the host being inspected:
 
 ```bash
-set -euo pipefail
-ARCH=amd64 # change to arm64 on a Linux ARM64 host
-ASSET="kubectl-hwhealth-linux-${ARCH}"
-BASE_URL="https://github.com/JemBuildz/kubectl-hwhealth/releases/latest/download"
-
-curl -fsSLo "$ASSET" "$BASE_URL/$ASSET"
-curl -fsSLo checksums.txt "$BASE_URL/checksums.txt"
-grep -F "  $ASSET" checksums.txt | sha256sum -c -
-
-gh attestation verify "$ASSET" \
-  --repo JemBuildz/kubectl-hwhealth \
-  --signer-workflow JemBuildz/kubectl-hwhealth/.github/workflows/release.yml
-
-chmod +x "$ASSET"
-sudo install -m 0755 "$ASSET" /usr/local/bin/kubectl-hwhealth
+kubectl hwhealth --context homelab --node-name worker-2
 ```
 
-The checksum helps detect corruption; because it is distributed with the binary, it is not an independent publisher-authentication mechanism. The `gh attestation verify` step verifies GitHub build provenance for the expected repository and workflow. It requires GitHub CLI with attestation support.
+`--context` is optional and defaults to the current `kubectl` context. `--node-name` can be omitted when the host name matches the Kubernetes node identity.
 
-See the [release page](https://github.com/JemBuildz/kubectl-hwhealth/releases) for assets, checksums, and provenance.
+To exercise the report path without relying on a degraded array, simulate a RAID finding:
 
-## Commands and options
+```bash
+kubectl hwhealth --simulate-raid-fail
+```
+
+This substitutes a simulated degraded RAID result in the local scan. It does not perform Kubernetes actions or send alerts.
+
+## Options and exit codes
 
 | Option | Purpose |
 |---|---|
-| `--context NAME` | Selects the Kubernetes context. Required with `--auto-cordon`, `--auto-drain`, or `--webhook-url`. |
-| `--node-name NAME` | Explicit Kubernetes node name for this host; when set, it must match exactly. |
-| `--warn-temp CELSIUS` | CPU/package warning threshold; default `75`. Must be greater than 0 and less than 135. |
-| `--simulate-raid-fail` | Simulates a degraded RAID finding. Any requested action remains dry-run. |
-| `--auto-cordon` | Cordon the uniquely matched local node after a confirmed failure. |
-| `--auto-drain` | Drain the uniquely matched local node after a confirmed failure. Cannot be combined with `--auto-cordon`. |
-| `--webhook-url URL` | Send a failure alert to an approved Slack or Discord HTTPS webhook. |
-| `--license-key KEY` | Provide a signed Pro key; alternatively set `HWHEALTH_LICENSE_KEY`. Required for live actions, not simulation. |
+| `--context NAME` | Select the Kubernetes context for the read-only node query. |
+| `--node-name NAME` | Explicit node name for this host; must match exactly when supplied. |
+| `--warn-temp CELSIUS` | CPU/package warning threshold; default `75`; must be finite and between 0 and 135. |
+| `--simulate-raid-fail` | Display a simulated degraded RAID finding; no action is performed. |
+| `--help` | Show the scanner options. |
 
-Run `kubectl hwhealth --help` for the CLI’s current flag descriptions.
+Exit code `0` means no critical finding was reported. Exit code `2` is used for a critical finding or invalid command-line input. A failed Kubernetes query is shown as a warning and the local host is still reported.
 
-## Safety model
+## Go package
 
-**The default path is observational.** The command reads local hardware files and queries Kubernetes nodes; it does not patch nodes, evict pods, or send alerts unless an action is explicitly requested.
+The reusable read-only scanner is available at `github.com/jembuildz/kubectl-hwhealth/pkg/health`:
 
-Before any live action, the program requires an explicit Kubernetes context, a uniquely matched local node, and a valid Ed25519-signed Pro key built against the configured public key. The key is a feature gate, not an authorization boundary—Kubernetes permissions still come from the active kubeconfig and RBAC identity. Use a dedicated identity with only the access required for the chosen operation.
+```go
+result, err := health.Scan(ctx, health.Options{
+    KubernetesContext: "homelab",
+    NodeName:          "worker-2",
+    WarnTempC:         80,
+})
+if err != nil {
+    return err
+}
+for _, node := range result.Reports {
+    fmt.Printf("%s: %s\n", node.Name, node.StatusDisplay)
+}
+```
 
-- `--auto-cordon` prevents new pods from scheduling on the selected node; it does not evict existing pods.
-- `--auto-drain` runs `kubectl drain --ignore-daemonsets --timeout=60s`. It does **not** pass `--delete-emptydir-data`; drain may fail when pods use local ephemeral data, leaving that decision to an operator.
-- Webhooks are restricted to HTTPS Slack and Discord endpoints on port 443. Hostnames are allowlisted, DNS answers are checked for private/special-use addresses, redirects are disabled, and non-2xx responses fail the command.
-- Missing sensor or RAID data is reported as unknown; unknown or ambiguous nodes are never treated as confirmed hardware failures.
+`health.Scan` reads the local host's hardware files and may call only `kubectl get nodes -o json`. Its public API contains no node-remediation or webhook operations.
 
-The release workflow runs tests and `go vet` on pushes, pull requests, and release builds. Build/test jobs use read-only repository permissions; a separate publisher job receives release-write permissions to attach binaries and attestations.
+## Safety
+
+This repository's current scanner-only code is observational: it reads local hardware files and issues a read-only Kubernetes node query. It contains no `cordon` or `drain` implementation, license-key gate, or webhook sender. A Kubernetes identity with permission to list nodes is sufficient for cluster association; no write permission is needed.
+
+Commercial Pro remediation is maintained separately and is not part of the current public source tree or scanner-only binaries.
 
 ## Development
 
 Requires Go 1.23 or newer.
 
 ```bash
-git clone https://github.com/JemBuildz/kubectl-hwhealth.git
-cd kubectl-hwhealth
 go test ./...
 go vet ./...
 go build .
 ```
 
-Contributions and bug reports are welcome through [GitHub Issues](https://github.com/JemBuildz/kubectl-hwhealth/issues) and pull requests. Please include reproducible hardware/OS details for sensor or RAID parsing reports, and never include real webhook URLs or private license-signing keys in issues.
+The release workflow runs tests and `go vet` on pushes and pull requests. Future published scanner-only releases build Linux amd64/arm64 binaries, checksums, and provenance attestations.
 
 ## License
 
-There is currently no `LICENSE` file in the repository. Do not assume the code is available under an open-source license; ask the maintainer before reusing or redistributing it.
+The scanner-only source in the current public branch is licensed under the MIT License; see [`LICENSE`](LICENSE). The historical `v0.2.0` tag and release predate the split and are not covered by the license added to this scanner-only snapshot. That tag and release have been left unchanged.
