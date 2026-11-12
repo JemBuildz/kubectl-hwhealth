@@ -4,15 +4,25 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/hex"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 )
 
-func TestParseMdstatMultiArray(t *testing.T) {
-	mdstatSample := `Personalities : [raid1] 
+func makeTestNode(name, hostname string) kubeNode {
+	var n kubeNode
+	n.Metadata.Name = name
+	if hostname != "" {
+		n.Metadata.Labels = map[string]string{"kubernetes.io/hostname": hostname}
+	}
+	n.Status.NodeInfo.Architecture = "amd64"
+	return n
+}
+
+func TestParseMdstatAggregatesWorstArrayState(t *testing.T) {
+	sample := `Personalities : [raid1]
 md0 : active raid1 sdb1[1] sda1[0]
       1047552 blocks super 1.2 [2/2] [UU]
       [==>..................]  resync = 12.4% (130432/1047552) finish=0.8min speed=18633K/sec
@@ -22,172 +32,211 @@ md1 : active raid1 sdd1[1] sdc1[0]
 
 unused devices: <none>
 `
-	summary, state := parseMdstat(mdstatSample)
+	summary, state := parseMdstat(sample)
 	if state != RaidDegraded {
-		t.Fatalf("expected RaidDegraded when md1 is [U_], got state=%v (summary=%q)", state, summary)
+		t.Fatalf("expected degraded worst state, got %v (%s)", state, summary)
 	}
 	if !strings.Contains(summary, "md1 [U_] DEGRADED") {
-		t.Errorf("expected summary to report md1 [U_] DEGRADED, got %q", summary)
+		t.Fatalf("degraded array missing from summary: %q", summary)
 	}
 }
 
-func TestReadMaxThermalCPrioritizesCPUSensor(t *testing.T) {
-	tmpDir := t.TempDir()
-	zone0 := filepath.Join(tmpDir, "thermal_zone0")
-	zone1 := filepath.Join(tmpDir, "thermal_zone1")
-	_ = os.MkdirAll(zone0, 0o755)
-	_ = os.MkdirAll(zone1, 0o755)
-
-	_ = os.WriteFile(filepath.Join(zone0, "type"), []byte("acpitz\n"), 0o644)
-	_ = os.WriteFile(filepath.Join(zone0, "temp"), []byte("65000\n"), 0o644)
-	_ = os.WriteFile(filepath.Join(zone1, "type"), []byte("x86_pkg_temp\n"), 0o644)
-	_ = os.WriteFile(filepath.Join(zone1, "temp"), []byte("58000\n"), 0o644)
-
-	temp, sensorType, ok := readMaxThermalC(tmpDir)
-	if !ok {
-		t.Fatal("expected thermal reading to succeed")
+func TestParseMdstatHealthyEmptyAndUnknown(t *testing.T) {
+	healthy := "Personalities : [raid1]\nmd0 : active raid1 sda1[0] sdb1[1]\n 1047552 blocks super 1.2 [2/2] [UU]\n"
+	_, state := parseMdstat(healthy)
+	if state != RaidHealthy {
+		t.Fatalf("expected healthy state, got %v", state)
 	}
-	if sensorType != "x86_pkg_temp" || temp != 58.0 {
-		t.Fatalf("expected CPU sensor x86_pkg_temp (58.0C), got %s (%.1fC)", sensorType, temp)
+
+	_, state = parseMdstat("Personalities : \nunused devices: <none>\n")
+	if state != RaidNone {
+		t.Fatalf("expected no arrays, got %v", state)
+	}
+
+	_, state = parseMdstat("md0 : active raid1 sda1[0] sdb1[1]\n 1000 blocks super 1.2\n")
+	if state != RaidUnknown {
+		t.Fatalf("array without a member-state field must be unknown, got %v", state)
 	}
 }
 
-func TestRemoteNodeAnnotationsRequireFreshnessAndEd25519Signature(t *testing.T) {
+func TestReadMaxThermalCUsesCPUZoneAndRejectsAmbientOnly(t *testing.T) {
+	root := t.TempDir()
+	writeZone := func(name, kind, temp string) {
+		t.Helper()
+		zone := filepath.Join(root, name)
+		if err := os.MkdirAll(zone, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(zone, "type"), []byte(kind+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(zone, "temp"), []byte(temp+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeZone("thermal_zone0", "acpitz", "65000")
+	writeZone("thermal_zone1", "x86_pkg_temp", "58000")
+
+	temp, sensor, ok := readMaxThermalC(root)
+	if !ok || temp != 58 || sensor != "x86_pkg_temp" {
+		t.Fatalf("expected CPU package reading 58C, got %.1f %q, ok=%v", temp, sensor, ok)
+	}
+
+	if err := os.RemoveAll(filepath.Join(root, "thermal_zone1")); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok := readMaxThermalC(root); ok {
+		t.Fatal("ambient-only reading must not be treated as a CPU temperature")
+	}
+}
+
+func TestUnknownTelemetryNeverDisplaysHealthy(t *testing.T) {
+	cases := []struct {
+		name   string
+		tempOK bool
+		raid   RaidState
+		temp   float64
+	}{
+		{name: "no temperature with no RAID", tempOK: false, raid: RaidNone},
+		{name: "temperature with unknown RAID", tempOK: true, raid: RaidUnknown, temp: 40},
+		{name: "nothing inspected", tempOK: false, raid: RaidUnknown},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := evaluateNodeTelemetry("node-a", "amd64", tc.temp, "", tc.tempOK, "n/a", tc.raid, 75, false, true)
+			if strings.Contains(r.StatusDisplay, "HEALTHY") || !strings.Contains(r.StatusDisplay, "UNKNOWN") {
+				t.Fatalf("partial/unknown telemetry must not report healthy: %q", r.StatusDisplay)
+			}
+			if r.Critical {
+				t.Fatalf("unknown telemetry must not trigger a critical action: %+v", r)
+			}
+		})
+	}
+}
+
+func TestClusterEvaluationOnlyTrustsUniqueLocalMatch(t *testing.T) {
+	items := []kubeNode{makeTestNode("node-local", "node-local"), makeTestNode("node-remote", "node-remote")}
+	reports, count := evaluateClusterNodes(items, "node-local", false, 90, "x86_pkg_temp", true, "md0 [U_] DEGRADED", RaidDegraded, 75)
+	if count != 1 || !reports[0].Critical || !reports[0].Actionable {
+		t.Fatalf("expected only the matched local node to be actionable: count=%d reports=%+v", count, reports)
+	}
+	if reports[1].Critical || reports[1].Actionable || !strings.Contains(reports[1].StatusDisplay, "UNKNOWN") {
+		t.Fatalf("remote node must remain unknown and non-actionable: %+v", reports[1])
+	}
+
+	ambiguous := []kubeNode{makeTestNode("node-a", "host-x"), makeTestNode("node-b", "host-x")}
+	reports, count = evaluateClusterNodes(ambiguous, "host-x", false, 90, "cpu", true, "md0 [U_]", RaidDegraded, 75)
+	if count != 2 {
+		t.Fatalf("expected ambiguous host identity, got %d matches", count)
+	}
+	for _, r := range reports {
+		if r.Actionable || r.Critical || !strings.Contains(r.StatusDisplay, "ambiguous") {
+			t.Fatalf("ambiguous identity must fail closed: %+v", r)
+		}
+	}
+}
+
+func TestLicenseAcceptsOnlyEd25519SignedKeys(t *testing.T) {
+	old := ed25519PubKeyHex
+	defer func() { ed25519PubKeyHex = old }()
+	ed25519PubKeyHex = ""
+	if verifyLicense("PRO-DEMO-2026") || verifyLicense("HWPRO-ABCD-123456") {
+		t.Fatal("demo and legacy forgeable formats must not authorize live actions")
+	}
+
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
-	pubHex := hex.EncodeToString(pub)
-	now := time.Date(2026, 11, 11, 18, 0, 0, 0, time.UTC)
-	freshTime := now.Add(-2 * time.Minute).Format(time.RFC3339)
-	staleTime := now.Add(-15 * time.Minute).Format(time.RFC3339)
-
-	// Sign valid payload for node-remote-valid
-	validPayload := canonicalNodeAnnotationPayload("node-remote-valid", "DEGRADED", "md0 [U_] DEGRADED", "82.0", freshTime)
-	validSig := hex.EncodeToString(ed25519.Sign(priv, validPayload))
-
-	// Sign payload for stale node (signature is valid, but timestamp is expired)
-	stalePayload := canonicalNodeAnnotationPayload("node-remote-stale", "DEGRADED", "md0 [U_] DEGRADED", "82.0", staleTime)
-	staleSig := hex.EncodeToString(ed25519.Sign(priv, stalePayload))
-
-	nodes := []kubeNode{
-		{
-			Metadata: struct {
-				Name        string            `json:"name"`
-				Labels      map[string]string `json:"labels"`
-				Annotations map[string]string `json:"annotations"`
-			}{
-				Name: "node-remote-unsigned",
-				Annotations: map[string]string{
-					"hwhealth.io/raid-state":   "DEGRADED",
-					"hwhealth.io/raid-summary": "md0 [U_] DEGRADED",
-					"hwhealth.io/cpu-temp-c":   "84.0",
-					"hwhealth.io/updated-at":   freshTime,
-				},
-			},
-		},
-		{
-			Metadata: struct {
-				Name        string            `json:"name"`
-				Labels      map[string]string `json:"labels"`
-				Annotations map[string]string `json:"annotations"`
-			}{
-				Name: "node-remote-stale",
-				Annotations: map[string]string{
-					"hwhealth.io/raid-state":   "DEGRADED",
-					"hwhealth.io/raid-summary": "md0 [U_] DEGRADED",
-					"hwhealth.io/cpu-temp-c":   "82.0",
-					"hwhealth.io/updated-at":   staleTime,
-					"hwhealth.io/signature":    staleSig,
-				},
-			},
-		},
-		{
-			Metadata: struct {
-				Name        string            `json:"name"`
-				Labels      map[string]string `json:"labels"`
-				Annotations map[string]string `json:"annotations"`
-			}{
-				Name: "node-remote-valid",
-				Annotations: map[string]string{
-					"hwhealth.io/raid-state":   "DEGRADED",
-					"hwhealth.io/raid-summary": "md0 [U_] DEGRADED",
-					"hwhealth.io/cpu-temp-c":   "82.0",
-					"hwhealth.io/updated-at":   freshTime,
-					"hwhealth.io/signature":    validSig,
-				},
-			},
-		},
-	}
-
-	reports := evaluateClusterNodes(nodes, "node-local", 45.0, "x86_pkg_temp", true, "md0 [UU]", RaidHealthy, 75.0, now, 5*time.Minute, pubHex)
-	if len(reports) != 3 {
-		t.Fatalf("expected 3 reports, got %d", len(reports))
-	}
-
-	// 1. Unsigned remote node must be rejected
-	if reports[0].Inspected || reports[0].Critical {
-		t.Errorf("expected unsigned remote node to be rejected as uninspected, got %+v", reports[0])
-	}
-	// 2. Stale remote node must be rejected
-	if reports[1].Inspected || reports[1].Critical {
-		t.Errorf("expected stale remote node to be rejected as uninspected, got %+v", reports[1])
-	}
-	// 3. Fresh + validly signed remote node must be accepted and marked critical
-	if !reports[2].Inspected || !reports[2].Critical {
-		t.Errorf("expected fresh Ed25519-signed remote node to be inspected and critical, got %+v", reports[2])
-	}
-}
-
-func TestPureEd25519LicenseAndSimulationIsolation(t *testing.T) {
-	// 1. Legacy symmetric HWPRO- keys must always fail
-	if valid, _ := verifyLicense("HWPRO-JEM2026A-94AE9B", false); valid {
-		t.Fatal("expected legacy symmetric HWPRO- key to be rejected")
-	}
-
-	// 2. Demo key must fail outside simulation mode
-	if valid, _ := verifyLicense("PRO-DEMO-2026", false); valid {
-		t.Fatal("expected PRO-DEMO-2026 to be rejected when simulateMode is false")
-	}
-
-	// 3. Valid Ed25519 production key verification
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	origPub := ed25519PubKeyHex
 	ed25519PubKeyHex = hex.EncodeToString(pub)
-	defer func() { ed25519PubKeyHex = origPub }()
-
-	msg := "HWPRO1.ACMECORP"
-	sig := ed25519.Sign(priv, []byte(msg))
-	prodToken := msg + "." + hex.EncodeToString(sig)
-
-	valid, dryRun := verifyLicense(prodToken, false)
-	if !valid || dryRun {
-		t.Fatalf("expected valid Ed25519 token to succeed with dryRun=false, got valid=%v dryRun=%v", valid, dryRun)
+	message := "HWPRO1.CUSTOMER"
+	token := message + "." + hex.EncodeToString(ed25519.Sign(priv, []byte(message)))
+	if !verifyLicense(token) {
+		t.Fatal("expected correctly signed token to verify")
 	}
-
-	// 4. Simulation mode MUST force dryRun=true even with a valid Ed25519 production key
-	validSim, dryRunSim := verifyLicense(prodToken, true)
-	if !validSim || !dryRunSim {
-		t.Fatalf("expected simulateMode=true with production key to force dryRun=true, got valid=%v dryRun=%v", validSim, dryRunSim)
-	}
-
-	// 5. Simulation mode combined with --publish-node-status must be rejected
-	if err := validateFlagCombinations(true, true); err == nil {
-		t.Fatal("expected --simulate-raid-fail + --publish-node-status to return an error")
+	if verifyLicense("HWPRO1.CUSTOMER." + strings.Repeat("00", ed25519.SignatureSize)) {
+		t.Fatal("invalid signature must be rejected")
 	}
 }
 
-func TestValidateWebhookURL(t *testing.T) {
-	if _, err := validateWebhookURL("http://hooks.slack.com/services/T00/B00/X00"); err == nil {
-		t.Error("expected http:// webhook URL to be rejected")
+func TestRunRejectsActionWithoutContext(t *testing.T) {
+	if code := run([]string{"--auto-cordon"}); code != 2 {
+		t.Fatalf("expected CLI usage failure without --context, got exit code %d", code)
 	}
-	if _, err := validateWebhookURL("https://127.0.0.1/webhook"); err == nil {
-		t.Error("expected loopback IP webhook to be rejected")
+}
+
+func TestAutomationRequiresExplicitContext(t *testing.T) {
+	err := runProAutomation(nil, true, false, "", "", "", true)
+	if err == nil || !strings.Contains(err.Error(), "context") {
+		t.Fatalf("expected missing context to be rejected, got %v", err)
 	}
-	if _, err := validateWebhookURL("https://hooks.slack.com/services/T00/B00/X00"); err != nil {
-		t.Errorf("expected valid HTTPS Slack URL to pass, got %v", err)
+}
+
+func TestSimulationNeverRunsKubectlOrWebhook(t *testing.T) {
+	dir := t.TempDir()
+	sentinel := filepath.Join(dir, "kubectl-was-called")
+	stub := filepath.Join(dir, "kubectl")
+	script := "#!/bin/sh\nprintf called > \"" + sentinel + "\"\n"
+	if err := os.WriteFile(stub, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	err := runProAutomation([]nodeHealthReport{{Name: "node-local", RaidSummary: "simulated", TempDisplay: "90C"}}, true, false, "http://127.0.0.1/not-a-real-webhook", "a-production-looking-key", "test-context", true)
+	if err != nil {
+		t.Fatalf("simulation should only print a dry-run plan: %v", err)
+	}
+	if _, err := os.Stat(sentinel); !os.IsNotExist(err) {
+		t.Fatalf("simulation invoked kubectl or created sentinel: stat err=%v", err)
+	}
+}
+
+func TestKubectlArgsPinsContext(t *testing.T) {
+	got := kubectlArgs("staging", "get", "nodes")
+	want := []string{"--context", "staging", "get", "nodes"}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("expected explicit context args %v, got %v", want, got)
+	}
+	if got := kubectlArgs("", "get", "nodes"); strings.Join(got, " ") != "get nodes" {
+		t.Fatalf("unexpected args without a context: %v", got)
+	}
+}
+
+func TestWebhookURLAllowlist(t *testing.T) {
+	valid := []string{
+		"https://hooks.slack.com/services/T00/B00/X00",
+		"https://discord.com/api/webhooks/123/token",
+		"https://discordapp.com/api/webhooks/123/token",
+	}
+	for _, value := range valid {
+		if _, err := validateWebhookURL(value); err != nil {
+			t.Errorf("expected allowed webhook URL %q: %v", value, err)
+		}
+	}
+	invalid := []string{
+		"http://hooks.slack.com/services/T00/B00/X00",
+		"https://127.0.0.1/services/x",
+		"https://attacker.example/services/x",
+		"https://user@hooks.slack.com/services/x",
+		"https://hooks.slack.com:8443/services/x",
+		"https://hooks.slack.com/other/path",
+		"https://hooks.slack.com/services/x?next=127.0.0.1",
+	}
+	for _, value := range invalid {
+		if _, err := validateWebhookURL(value); err == nil {
+			t.Errorf("expected webhook URL %q to be rejected", value)
+		}
+	}
+}
+
+func TestUnsafeWebhookIPRejectsSpecialUseAddresses(t *testing.T) {
+	unsafe := []string{"127.0.0.1", "10.0.0.1", "169.254.169.254", "::1", "0.0.0.0", "224.0.0.1"}
+	for _, value := range unsafe {
+		if !unsafeWebhookIP(net.ParseIP(value)) {
+			t.Errorf("expected %s to be rejected", value)
+		}
+	}
+	if unsafeWebhookIP(net.ParseIP("8.8.8.8")) {
+		t.Error("expected a public unicast IP to pass the address check")
 	}
 }

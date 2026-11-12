@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
@@ -9,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -31,6 +33,10 @@ const (
 	colorCyan   = "\033[36m"
 )
 
+// Set at release-build time to the public key corresponding to the offline
+// license-signing key. The private signing key must never be shipped here.
+var ed25519PubKeyHex = ""
+
 type RaidState int
 
 const (
@@ -41,18 +47,10 @@ const (
 	RaidDegraded
 )
 
-// Injected at release build time via -ldflags "-X main.ed25519PubKeyHex=..."
-// Default value is a 32-byte Ed25519 public key; private signing key is never stored in repo.
-var ed25519PubKeyHex = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
-
-// Optional cluster-wide Ed25519 public key for verifying remote node annotations
-var ed25519NodePubKeyHex = ""
-
 type kubeNode struct {
 	Metadata struct {
-		Name        string            `json:"name"`
-		Labels      map[string]string `json:"labels"`
-		Annotations map[string]string `json:"annotations"`
+		Name   string            `json:"name"`
+		Labels map[string]string `json:"labels"`
 	} `json:"metadata"`
 	Spec struct {
 		Unschedulable bool `json:"unschedulable"`
@@ -76,310 +74,200 @@ type nodeHealthReport struct {
 	StatusDisplay string
 	Critical      bool
 	Inspected     bool
+	Actionable    bool
 }
 
-var mdDeviceHeader = regexp.MustCompile(`^(md\d+)\s*:\s*(\S+)\s+(\S+)`)
-var mdMemberState = regexp.MustCompile(`\[([U_]+)\]`)
+var (
+	mdDeviceHeader = regexp.MustCompile(`^(md\d+)\s*:\s*(\S+)\s+(\S+)`)
+	mdMemberState  = regexp.MustCompile(`\[([U_]+)\]`)
+)
 
 func main() {
-	warnTemp := flag.Float64("warn-temp", 75.0, "CPU/package temperature threshold in Celsius")
-	nodeNameFlag := flag.String("node-name", "", "Explicit Kubernetes node name corresponding to this host (defaults to hostname)")
-	publishStatus := flag.Bool("publish-node-status", false, "Sign and publish local hardware telemetry annotations to the local Kubernetes node")
-	nodeSigningKeyFlag := flag.String("node-signing-key", "", "Ed25519 private key (64-byte hex or 32-byte seed hex) for --publish-node-status (or HWHEALTH_NODE_SIGNING_KEY env)")
-	nodeVerifyPubFlag := flag.String("node-verify-pubkey", "", "Ed25519 public key (32-byte hex) to verify remote node annotations (or HWHEALTH_NODE_VERIFY_PUBKEY env)")
-	annotationMaxAge := flag.Duration("annotation-max-age", 5*time.Minute, "Maximum allowed age for remote node telemetry annotations")
-	simulateFail := flag.Bool("simulate-raid-fail", false, "Simulate a degraded RAID array (strictly dry-run; never mutates live cluster)")
-	autoCordon := flag.Bool("auto-cordon", false, "[PRO] Automatically cordon verified failing nodes (kubectl cordon)")
-	autoDrain := flag.Bool("auto-drain", false, "[PRO] Automatically cordon AND evict pods on verified failing nodes (kubectl drain)")
-	webhookURL := flag.String("webhook-url", "", "[PRO] HTTPS Slack or Discord webhook URL for hardware failure alerts")
-	licenseKeyFlag := flag.String("license-key", "", "Pro Ed25519 license token HWPRO1.<id>.<sig> (or HWHEALTH_LICENSE_KEY env)")
-	flag.Parse()
+	os.Exit(run(os.Args[1:]))
+}
 
-	if err := validateFlagCombinations(*simulateFail, *publishStatus); err != nil {
-		fmt.Fprintf(os.Stderr, "%s[ERROR] %v%s\n", colorRed, err, colorReset)
-		os.Exit(1)
+func run(args []string) int {
+	fs := flag.NewFlagSet("kubectl-hwhealth", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	warnTemp := fs.Float64("warn-temp", 75.0, "CPU/package temperature threshold in Celsius")
+	nodeNameFlag := fs.String("node-name", "", "Kubernetes node name for this host; set explicitly if hostname differs")
+	contextFlag := fs.String("context", "", "Kubernetes context to inspect and target; required with remediation/webhooks")
+	simulateFail := fs.Bool("simulate-raid-fail", false, "Simulate a degraded array; all actions are always dry-run")
+	autoCordon := fs.Bool("auto-cordon", false, "Cordon the verified local node on a confirmed hardware failure")
+	autoDrain := fs.Bool("auto-drain", false, "Drain the verified local node on a confirmed hardware failure")
+	webhookURL := fs.String("webhook-url", "", "Slack or Discord HTTPS webhook URL")
+	licenseKeyFlag := fs.String("license-key", "", "Signed license key, or set HWHEALTH_LICENSE_KEY")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(os.Stderr, "unexpected positional arguments")
+		return 2
+	}
+	if math.IsNaN(*warnTemp) || math.IsInf(*warnTemp, 0) || *warnTemp <= 0 || *warnTemp >= 135 {
+		fmt.Fprintln(os.Stderr, "--warn-temp must be a finite value greater than 0 and less than 135 Celsius")
+		return 2
+	}
+	if *autoCordon && *autoDrain {
+		fmt.Fprintln(os.Stderr, "choose either --auto-cordon or --auto-drain, not both")
+		return 2
+	}
+	wantAction := *autoCordon || *autoDrain || *webhookURL != ""
+	kubeContext := strings.TrimSpace(*contextFlag)
+	if wantAction && kubeContext == "" {
+		fmt.Fprintln(os.Stderr, "--context is required with --auto-cordon, --auto-drain, or --webhook-url")
+		return 2
 	}
 
-	licenseKey := firstNonEmpty(*licenseKeyFlag, os.Getenv("HWHEALTH_LICENSE_KEY"))
-	nodeSigningKey := firstNonEmpty(*nodeSigningKeyFlag, os.Getenv("HWHEALTH_NODE_SIGNING_KEY"))
-	nodeVerifyPub := firstNonEmpty(*nodeVerifyPubFlag, os.Getenv("HWHEALTH_NODE_VERIFY_PUBKEY"), ed25519NodePubKeyHex)
+	licenseKey := strings.TrimSpace(*licenseKeyFlag)
+	if licenseKey == "" {
+		licenseKey = strings.TrimSpace(os.Getenv("HWHEALTH_LICENSE_KEY"))
+	}
 
-	fmt.Printf("%s=== kubectl-hwhealth v0.2.0: Bare-Metal RAID & Thermal Scanner ===%s\n\n", colorCyan, colorReset)
-
+	fmt.Printf("%s=== kubectl-hwhealth: Bare-Metal RAID & Thermal Scanner ===%s\n\n", colorCyan, colorReset)
 	localHost := resolveLocalNodeName(*nodeNameFlag)
-	cpuTemp, sensorType, tempOK := readMaxThermalC("/sys/class/thermal")
+	tempC, sensorType, tempOK := readMaxThermalC("/sys/class/thermal")
 	raidSummary, raidState := checkLinuxRAID("/proc/mdstat", *simulateFail, runtime.GOOS)
 
-	if *publishStatus {
-		if err := annotateLocalNode(localHost, cpuTemp, tempOK, raidSummary, raidState, nodeSigningKey, time.Now().UTC()); err != nil {
-			fmt.Fprintf(os.Stderr, "%s[ERROR] Failed to publish node annotations for '%s': %v%s\n", colorRed, localHost, err, colorReset)
-			os.Exit(1)
+	nodes, kubeErr := fetchKubeNodes(kubeContext)
+	clusterAvailable := kubeErr == nil && len(nodes.Items) > 0
+	var reports []nodeHealthReport
+	var localMatchCount int
+	if clusterAvailable {
+		reports, localMatchCount = evaluateClusterNodes(nodes.Items, localHost, *nodeNameFlag != "", tempC, sensorType, tempOK, raidSummary, raidState, *warnTemp)
+	} else {
+		if kubeErr != nil {
+			fmt.Fprintf(os.Stderr, "[!] kubectl get nodes failed; reporting this host only: %v\n", kubeErr)
+		} else {
+			fmt.Fprintln(os.Stderr, "[!] Kubernetes returned no nodes; reporting this host only")
 		}
-		fmt.Printf("%s[OK] Published signed hardware telemetry annotations to node '%s'.%s\n\n", colorGreen, localHost, colorReset)
+		reports = []nodeHealthReport{evaluateNodeTelemetry(localHost, runtime.GOARCH, tempC, sensorType, tempOK, raidSummary, raidState, *warnTemp, false, false)}
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
 	fmt.Fprintln(w, "NODE\tARCH\tTHERMAL\tRAID ARRAY\tHARDWARE STATUS")
-
-	nodes, kubeErr := fetchKubeNodes()
-	var reports []nodeHealthReport
-	now := time.Now().UTC()
-
-	if kubeErr != nil {
-		fmt.Fprintf(os.Stderr, "%s[!] kubectl get nodes failed (%v) — reporting local host '%s' only%s\n\n", colorYellow, kubeErr, localHost, colorReset)
-		rep := evaluateNodeTelemetry(localHost, runtime.GOARCH, cpuTemp, sensorType, tempOK, raidSummary, raidState, *warnTemp, false)
-		reports = append(reports, rep)
-	} else if len(nodes.Items) == 0 {
-		rep := evaluateNodeTelemetry(localHost, runtime.GOARCH, cpuTemp, sensorType, tempOK, raidSummary, raidState, *warnTemp, false)
-		reports = append(reports, rep)
-	} else {
-		reports = evaluateClusterNodes(nodes.Items, localHost, cpuTemp, sensorType, tempOK, raidSummary, raidState, *warnTemp, now, *annotationMaxAge, nodeVerifyPub)
-	}
-
 	var failingNodes []nodeHealthReport
+	anyCritical := false
 	for _, r := range reports {
 		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", r.Name, r.Arch, r.TempDisplay, r.RaidSummary, r.StatusDisplay)
-		if r.Critical && r.Inspected {
+		if r.Critical {
+			anyCritical = true
+		}
+		if r.Critical && r.Actionable {
 			failingNodes = append(failingNodes, r)
 		}
 	}
-	w.Flush()
+	_ = w.Flush()
 
-	wantProAction := *autoCordon || *autoDrain || *webhookURL != ""
-	if len(failingNodes) > 0 && !wantProAction {
-		fmt.Printf("\n%s[!] VERIFIED HARDWARE FAILURE on %d node(s).%s\n", colorRed, len(failingNodes), colorReset)
-		fmt.Println("-> Pass --auto-cordon, --auto-drain, or --webhook-url with a Pro license key to remediate:")
-		fmt.Println("   kubectl hwhealth --auto-cordon --webhook-url=https://... --license-key=HWPRO1.<ID>.<SIG>")
-		os.Exit(2)
+	if wantAction && (!clusterAvailable || localMatchCount != 1) {
+		fmt.Fprintln(os.Stderr, "[ERROR] refusing remediation: this host could not be matched to exactly one Kubernetes node")
+		return 1
 	}
-
-	if wantProAction {
-		if err := runProAutomation(failingNodes, *autoCordon, *autoDrain, *webhookURL, licenseKey, *simulateFail); err != nil {
+	if wantAction {
+		if err := runProAutomation(failingNodes, *autoCordon, *autoDrain, *webhookURL, licenseKey, kubeContext, *simulateFail); err != nil {
 			fmt.Fprintf(os.Stderr, "%s[ERROR] %v%s\n", colorRed, err, colorReset)
-			os.Exit(1)
+			return 1
 		}
 	}
-
-	if len(failingNodes) > 0 && !*simulateFail {
-		os.Exit(2)
+	if anyCritical {
+		return 2
 	}
-}
-
-func firstNonEmpty(vals ...string) string {
-	for _, v := range vals {
-		if strings.TrimSpace(v) != "" {
-			return strings.TrimSpace(v)
-		}
-	}
-	return ""
-}
-
-// validateFlagCombinations prevents simulated failures from ever writing fake telemetry to live nodes.
-func validateFlagCombinations(simulateFail, publishStatus bool) error {
-	if simulateFail && publishStatus {
-		return errors.New("--simulate-raid-fail cannot be combined with --publish-node-status (refusing to publish simulated failure state to live cluster annotations)")
-	}
-	return nil
+	return 0
 }
 
 func resolveLocalNodeName(override string) string {
 	if strings.TrimSpace(override) != "" {
 		return strings.TrimSpace(override)
 	}
-	h, err := os.Hostname()
-	if err != nil || h == "" {
+	host, err := os.Hostname()
+	if err != nil || strings.TrimSpace(host) == "" {
 		return "local-host"
 	}
-	return h
+	return strings.TrimSpace(host)
 }
 
-// evaluateClusterNodes binds local hardware readings strictly to the matching local node.
-// Remote nodes require BOTH a fresh RFC3339 timestamp (<= maxAge) AND a valid Ed25519 signature.
-func evaluateClusterNodes(
-	items []kubeNode,
-	localHost string,
-	localTemp float64,
-	sensorType string,
-	tempOK bool,
-	localRaid string,
-	localRaidState RaidState,
-	warnTemp float64,
-	now time.Time,
-	maxAge time.Duration,
-	nodeVerifyPubHex string,
-) []nodeHealthReport {
-	var out []nodeHealthReport
-	for _, n := range items {
-		name := n.Metadata.Name
-		arch := n.Status.NodeInfo.Architecture
-		hostLabel := n.Metadata.Labels["kubernetes.io/hostname"]
-
-		if strings.EqualFold(name, localHost) || (hostLabel != "" && strings.EqualFold(hostLabel, localHost)) {
-			rep := evaluateNodeTelemetry(name, arch, localTemp, sensorType, tempOK, localRaid, localRaidState, warnTemp, n.Spec.Unschedulable)
-			out = append(out, rep)
-			continue
+func evaluateClusterNodes(items []kubeNode, localHost string, explicitName bool, localTemp float64, sensorType string, tempOK bool, localRaid string, localRaidState RaidState, warnTemp float64) ([]nodeHealthReport, int) {
+	matches := make([]bool, len(items))
+	matchCount := 0
+	for i, n := range items {
+		match := false
+		if explicitName {
+			match = n.Metadata.Name == localHost
+		} else {
+			match = strings.EqualFold(n.Metadata.Name, localHost)
+			if n.Metadata.Labels["kubernetes.io/hostname"] != "" {
+				match = match || strings.EqualFold(n.Metadata.Labels["kubernetes.io/hostname"], localHost)
+			}
 		}
-
-		ann := n.Metadata.Annotations
-		if ann == nil || ann["hwhealth.io/raid-state"] == "" {
-			out = append(out, uninspectedReport(name, arch, "UNKNOWN (uninspected remote node)", n.Spec.Unschedulable))
-			continue
+		if match {
+			matches[i] = true
+			matchCount++
 		}
-
-		// 1. Verify annotation freshness (TTL)
-		updatedStr := strings.TrimSpace(ann["hwhealth.io/updated-at"])
-		updatedAt, err := time.Parse(time.RFC3339, updatedStr)
-		if err != nil || updatedAt.After(now.Add(30*time.Second)) || now.Sub(updatedAt) > maxAge {
-			out = append(out, uninspectedReport(name, arch, "UNKNOWN (stale/expired node annotation)", n.Spec.Unschedulable))
-			continue
-		}
-
-		// 2. Verify Ed25519 node annotation signature
-		if !verifyNodeAnnotationSignature(name, ann, nodeVerifyPubHex) {
-			out = append(out, uninspectedReport(name, arch, "UNKNOWN (unsigned/unverified annotation)", n.Spec.Unschedulable))
-			continue
-		}
-
-		rState := parseRaidStateString(ann["hwhealth.io/raid-state"])
-		rSummary := ann["hwhealth.io/raid-summary"]
-		if rSummary == "" {
-			rSummary = ann["hwhealth.io/raid-state"]
-		}
-		tVal, tErr := strconv.ParseFloat(ann["hwhealth.io/cpu-temp-c"], 64)
-		rep := evaluateNodeTelemetry(name, arch, tVal, "verified-agent", tErr == nil && tVal > 0, rSummary, rState, warnTemp, n.Spec.Unschedulable)
-		out = append(out, rep)
 	}
-	return out
+
+	reports := make([]nodeHealthReport, 0, len(items)+1)
+	for i, n := range items {
+		name := n.Metadata.Name
+		if matches[i] && matchCount == 1 {
+			reports = append(reports, evaluateNodeTelemetry(name, n.Status.NodeInfo.Architecture, localTemp, sensorType, tempOK, localRaid, localRaidState, warnTemp, n.Spec.Unschedulable, true))
+			continue
+		}
+		unknownReason := "UNKNOWN (uninspected remote node)"
+		if matches[i] && matchCount > 1 {
+			unknownReason = "UNKNOWN (ambiguous local identity)"
+		}
+		reports = append(reports, unknownNodeReport(name, n.Status.NodeInfo.Architecture, unknownReason, n.Spec.Unschedulable))
+	}
+	if matchCount == 0 {
+		reports = append(reports, evaluateNodeTelemetry(localHost, runtime.GOARCH, localTemp, sensorType, tempOK, localRaid, localRaidState, warnTemp, false, false))
+	}
+	return reports, matchCount
 }
 
-func uninspectedReport(name, arch, reason string, cordoned bool) nodeHealthReport {
+func unknownNodeReport(name, arch, reason string, cordoned bool) nodeHealthReport {
 	status := colorYellow + reason + colorReset
 	if cordoned {
 		status += " (CORDONED)"
 	}
 	return nodeHealthReport{
-		Name:          name,
-		Arch:          arch,
-		TempDisplay:   "UNKNOWN",
-		RaidSummary:   "UNKNOWN",
-		StatusDisplay: status,
-		Critical:      false,
-		Inspected:     false,
+		Name: name, Arch: arch, TempDisplay: "UNKNOWN", RaidSummary: "UNKNOWN (no authenticated telemetry)",
+		StatusDisplay: status, Critical: false, Inspected: false, Actionable: false,
 	}
 }
 
-func canonicalNodeAnnotationPayload(nodeName, raidState, raidSummary, cpuTemp, updatedAt string) []byte {
-	return []byte(fmt.Sprintf("hwhealth-v2|%s|%s|%s|%s|%s", nodeName, raidState, raidSummary, cpuTemp, updatedAt))
-}
-
-func verifyNodeAnnotationSignature(nodeName string, ann map[string]string, pubHex string) bool {
-	pubBytes, err := hex.DecodeString(strings.TrimSpace(pubHex))
-	if err != nil || len(pubBytes) != ed25519.PublicKeySize {
-		return false
-	}
-	sigBytes, err := hex.DecodeString(strings.TrimSpace(ann["hwhealth.io/signature"]))
-	if err != nil || len(sigBytes) != ed25519.SignatureSize {
-		return false
-	}
-	payload := canonicalNodeAnnotationPayload(
-		nodeName,
-		ann["hwhealth.io/raid-state"],
-		ann["hwhealth.io/raid-summary"],
-		ann["hwhealth.io/cpu-temp-c"],
-		ann["hwhealth.io/updated-at"],
-	)
-	return ed25519.Verify(ed25519.PublicKey(pubBytes), payload, sigBytes)
-}
-
-func parseEd25519PrivateKey(keyHex string) (ed25519.PrivateKey, error) {
-	raw, err := hex.DecodeString(strings.TrimSpace(keyHex))
-	if err != nil {
-		return nil, fmt.Errorf("invalid hex key: %v", err)
-	}
-	switch len(raw) {
-	case ed25519.SeedSize:
-		return ed25519.NewKeyFromSeed(raw), nil
-	case ed25519.PrivateKeySize:
-		return ed25519.PrivateKey(raw), nil
-	default:
-		return nil, fmt.Errorf("expected 32-byte seed or 64-byte Ed25519 private key, got %d bytes", len(raw))
-	}
-}
-
-func annotateLocalNode(nodeName string, tempC float64, tempOK bool, raidSummary string, raidState RaidState, signingKeyHex string, now time.Time) error {
-	if strings.TrimSpace(signingKeyHex) == "" {
-		return errors.New("--publish-node-status requires an Ed25519 signing key (--node-signing-key or HWHEALTH_NODE_SIGNING_KEY)")
-	}
-	privKey, err := parseEd25519PrivateKey(signingKeyHex)
-	if err != nil {
-		return err
-	}
-
-	rStateStr := raidStateToString(raidState)
-	tempStr := "UNKNOWN"
-	if tempOK {
-		tempStr = fmt.Sprintf("%.1f", tempC)
-	}
-	updatedAt := now.UTC().Format(time.RFC3339)
-	payload := canonicalNodeAnnotationPayload(nodeName, rStateStr, raidSummary, tempStr, updatedAt)
-	sigHex := hex.EncodeToString(ed25519.Sign(privKey, payload))
-
-	args := []string{
-		"annotate", "node", nodeName, "--overwrite",
-		fmt.Sprintf("hwhealth.io/raid-state=%s", rStateStr),
-		fmt.Sprintf("hwhealth.io/raid-summary=%s", raidSummary),
-		fmt.Sprintf("hwhealth.io/cpu-temp-c=%s", tempStr),
-		fmt.Sprintf("hwhealth.io/updated-at=%s", updatedAt),
-		fmt.Sprintf("hwhealth.io/signature=%s", sigHex),
-	}
-	cmd := exec.Command("kubectl", args...)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("%v (%s)", err, strings.TrimSpace(string(out)))
-	}
-	return nil
-}
-
-func evaluateNodeTelemetry(name, arch string, tempC float64, sensorType string, tempOK bool, raidSummary string, raidState RaidState, warnTemp float64, cordoned bool) nodeHealthReport {
-	tempDisp := "UNKNOWN (no sensor)"
+func evaluateNodeTelemetry(name, arch string, tempC float64, sensorType string, tempOK bool, raidSummary string, raidState RaidState, warnTemp float64, cordoned, actionable bool) nodeHealthReport {
+	tempDisplay := "UNKNOWN (CPU sensor unavailable)"
 	if tempOK {
 		if sensorType != "" {
-			tempDisp = fmt.Sprintf("%.1f°C (%s)", tempC, sensorType)
+			tempDisplay = fmt.Sprintf("%.1f°C (%s)", tempC, sensorType)
 		} else {
-			tempDisp = fmt.Sprintf("%.1f°C", tempC)
+			tempDisplay = fmt.Sprintf("%.1f°C", tempC)
 		}
 	}
 
 	var status string
-	var critical bool
-
+	critical := false
 	switch {
 	case raidState == RaidDegraded:
-		status = colorRed + "CRITICAL: RAID DEGRADED" + colorReset
-		critical = true
+		status, critical = colorRed+"CRITICAL: RAID DEGRADED"+colorReset, true
 	case tempOK && tempC >= warnTemp:
-		status = colorRed + "CRITICAL: THERMAL THRESHOLD" + colorReset
-		critical = true
+		status, critical = colorRed+"CRITICAL: THERMAL THRESHOLD"+colorReset, true
 	case raidState == RaidResyncing:
 		status = colorYellow + "WARNING: RAID RESYNCING" + colorReset
-	case !tempOK && raidState == RaidUnknown:
-		status = colorYellow + "UNKNOWN (sensors unavailable)" + colorReset
+	case !tempOK:
+		status = colorYellow + "UNKNOWN (CPU sensor unavailable)" + colorReset
+	case raidState == RaidUnknown:
+		status = colorYellow + "UNKNOWN (RAID state unavailable)" + colorReset
 	default:
 		status = colorGreen + "HEALTHY" + colorReset
 	}
-
 	if cordoned {
 		status += " (CORDONED)"
 	}
-
 	return nodeHealthReport{
-		Name:          name,
-		Arch:          arch,
-		TempDisplay:   tempDisp,
-		RaidSummary:   raidSummary,
-		StatusDisplay: status,
-		Critical:      critical,
-		Inspected:     tempOK || raidState != RaidUnknown,
+		Name: name, Arch: arch, TempDisplay: tempDisplay, RaidSummary: raidSummary,
+		StatusDisplay: status, Critical: critical, Inspected: tempOK || raidState != RaidUnknown,
+		Actionable: actionable,
 	}
 }
 
@@ -392,108 +280,91 @@ func checkLinuxRAID(mdstatPath string, simulateFail bool, goos string) (string, 
 	}
 	data, err := os.ReadFile(mdstatPath)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return "NONE (mdraid not present)", RaidNone
-		}
 		return "UNKNOWN (cannot read /proc/mdstat)", RaidUnknown
 	}
 	return parseMdstat(string(data))
 }
 
 func parseMdstat(content string) (string, RaidState) {
-	lines := strings.Split(content, "\n")
 	type arrayInfo struct {
-		name   string
-		detail string
-		state  RaidState
+		name       string
+		detail     string
+		state      RaidState
+		active     bool
+		hasMembers bool
 	}
 	var arrays []arrayInfo
 	var current *arrayInfo
-
-	flushCurrent := func() {
-		if current != nil {
-			arrays = append(arrays, *current)
-			current = nil
+	flush := func() {
+		if current == nil {
+			return
 		}
+		if !current.active && current.state != RaidDegraded {
+			current.state = RaidUnknown
+			current.detail = current.name + " (inactive/unknown)"
+		} else if !current.hasMembers && current.state != RaidResyncing && current.state != RaidDegraded {
+			current.state = RaidUnknown
+			current.detail = current.name + " (member state unavailable)"
+		}
+		arrays = append(arrays, *current)
+		current = nil
 	}
 
-	for _, rawLine := range lines {
-		line := strings.TrimSpace(rawLine)
-		if matches := mdDeviceHeader.FindStringSubmatch(line); matches != nil {
-			flushCurrent()
-			devName := matches[1]
-			devState := matches[2]
-			st := RaidHealthy
-			if devState != "active" {
-				st = RaidDegraded
-			}
-			current = &arrayInfo{
-				name:   devName,
-				detail: devName + "[healthy]",
-				state:  st,
-			}
+	for _, raw := range strings.Split(content, "\n") {
+		line := strings.TrimSpace(raw)
+		if m := mdDeviceHeader.FindStringSubmatch(line); m != nil {
+			flush()
+			current = &arrayInfo{name: m[1], active: m[2] == "active", state: RaidUnknown, detail: m[1] + " (unknown)"}
 		}
 		if current == nil {
 			continue
 		}
 		if m := mdMemberState.FindStringSubmatch(line); m != nil {
 			members := m[1]
+			current.hasMembers = true
 			if strings.Contains(members, "_") {
 				current.state = RaidDegraded
 				current.detail = fmt.Sprintf("%s [%s] DEGRADED", current.name, members)
-			} else if current.state != RaidDegraded {
+			} else if current.active {
+				current.state = RaidHealthy
 				current.detail = fmt.Sprintf("%s [%s]", current.name, members)
 			}
 		}
-		if (strings.Contains(line, "recovery") || strings.Contains(line, "resync")) && current.state != RaidDegraded {
-			current.state = RaidResyncing
-			current.detail = fmt.Sprintf("%s (RESYNCING)", current.name)
+		if strings.Contains(line, "recovery") || strings.Contains(line, "resync") {
+			if current.state != RaidDegraded {
+				current.state = RaidResyncing
+				current.detail = fmt.Sprintf("%s (RESYNCING)", current.name)
+			}
 		}
 	}
-	flushCurrent()
-
+	flush()
 	if len(arrays) == 0 {
 		return "NONE (0 active md arrays)", RaidNone
 	}
 
-	worstState := RaidHealthy
+	worst := RaidHealthy
 	var summaries []string
-	for _, a := range arrays {
-		summaries = append(summaries, a.detail)
-		if a.state > worstState {
-			worstState = a.state
+	for _, array := range arrays {
+		summaries = append(summaries, array.detail)
+		if raidSeverity(array.state) > raidSeverity(worst) {
+			worst = array.state
 		}
 	}
-	return strings.Join(summaries, ", "), worstState
+	return strings.Join(summaries, ", "), worst
 }
 
-func parseRaidStateString(s string) RaidState {
-	switch strings.ToUpper(strings.TrimSpace(s)) {
-	case "DEGRADED":
-		return RaidDegraded
-	case "RESYNCING":
-		return RaidResyncing
-	case "HEALTHY":
-		return RaidHealthy
-	case "NONE":
-		return RaidNone
-	default:
-		return RaidUnknown
-	}
-}
-
-func raidStateToString(s RaidState) string {
-	switch s {
+func raidSeverity(state RaidState) int {
+	switch state {
 	case RaidDegraded:
-		return "DEGRADED"
+		return 4
+	case RaidUnknown:
+		return 3
 	case RaidResyncing:
-		return "RESYNCING"
+		return 2
 	case RaidHealthy:
-		return "HEALTHY"
-	case RaidNone:
-		return "NONE"
+		return 1
 	default:
-		return "UNKNOWN"
+		return 0
 	}
 }
 
@@ -502,89 +373,77 @@ func readMaxThermalC(thermalRoot string) (float64, string, bool) {
 	if err != nil || len(files) == 0 {
 		return 0, "", false
 	}
-	maxCPU := -1.0
-	var cpuType string
-	maxAny := -1.0
-	var anyType string
-
+	maxTemp := -1.0
+	var sensorType string
 	for _, tempFile := range files {
-		rawBytes, err := os.ReadFile(tempFile)
-		if err != nil {
-			continue
-		}
-		val, err := strconv.Atoi(strings.TrimSpace(string(rawBytes)))
-		if err != nil {
-			continue
-		}
-		c := float64(val) / 1000.0
-		if c <= 0.0 || c >= 135.0 {
-			continue
-		}
-
 		zoneDir := filepath.Dir(tempFile)
-		typeBytes, _ := os.ReadFile(filepath.Join(zoneDir, "type"))
-		zType := strings.TrimSpace(string(typeBytes))
-		if zType == "" {
-			zType = "thermal"
+		typeBytes, err := os.ReadFile(filepath.Join(zoneDir, "type"))
+		if err != nil {
+			continue
 		}
-
-		if isCPUSensorType(zType) && c > maxCPU {
-			maxCPU = c
-			cpuType = zType
+		zoneType := strings.TrimSpace(string(typeBytes))
+		if !isCPUSensorType(zoneType) {
+			continue
 		}
-		if c > maxAny {
-			maxAny = c
-			anyType = zType
+		raw, err := os.ReadFile(tempFile)
+		if err != nil {
+			continue
+		}
+		milliC, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+		if err != nil {
+			continue
+		}
+		tempC := float64(milliC) / 1000
+		if tempC <= 0 || tempC >= 135 {
+			continue
+		}
+		if tempC > maxTemp {
+			maxTemp, sensorType = tempC, zoneType
 		}
 	}
-
-	if maxCPU > 0 {
-		return maxCPU, cpuType, true
+	if maxTemp < 0 {
+		return 0, "", false
 	}
-	if maxAny > 0 {
-		return maxAny, anyType, true
-	}
-	return 0, "", false
+	return maxTemp, sensorType, true
 }
 
 func isCPUSensorType(zoneType string) bool {
 	lower := strings.ToLower(zoneType)
-	for _, kw := range []string{"x86_pkg", "cpu", "coretemp", "k10temp", "soc", "package", "tctl"} {
-		if strings.Contains(lower, kw) {
+	for _, keyword := range []string{"x86_pkg", "cpu", "coretemp", "k10temp", "soc", "package", "tctl"} {
+		if strings.Contains(lower, keyword) {
 			return true
 		}
 	}
 	return false
 }
 
-func fetchKubeNodes() (kubeNodeList, error) {
+func fetchKubeNodes(kubeContext string) (kubeNodeList, error) {
 	var list kubeNodeList
-	cmd := exec.Command("kubectl", "get", "nodes", "-o", "json")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "kubectl", kubectlArgs(kubeContext, "get", "nodes", "-o", "json")...)
 	out, err := cmd.Output()
 	if err != nil {
 		return list, err
 	}
-	err = json.Unmarshal(out, &list)
-	return list, err
+	if err := json.Unmarshal(out, &list); err != nil {
+		return list, fmt.Errorf("invalid kubectl JSON output: %w", err)
+	}
+	return list, nil
 }
 
-// verifyLicense strictly validates Ed25519 asymmetric tokens (HWPRO1.<CustomerID>.<128-hex-char-Ed25519-sig>).
-// No symmetric secrets exist in the binary. Furthermore, whenever simulateMode is true, dryRunOnly is forced true
-// even if a valid production license key is supplied.
-func verifyLicense(key string, simulateMode bool) (valid bool, dryRunOnly bool) {
-	if key == "PRO-DEMO-2026" {
-		if simulateMode {
-			return true, true
-		}
-		return false, false
+func kubectlArgs(kubeContext string, args ...string) []string {
+	if strings.TrimSpace(kubeContext) == "" {
+		return args
 	}
+	return append([]string{"--context", strings.TrimSpace(kubeContext)}, args...)
+}
 
-	if strings.HasPrefix(key, "HWPRO1.") && ed25519PubKeyHex != "" {
-		if verifyEd25519License(key, ed25519PubKeyHex) {
-			return true, simulateMode
-		}
+func verifyLicense(key string) bool {
+	if !strings.HasPrefix(key, "HWPRO1.") || ed25519PubKeyHex == "" {
+		return false
 	}
-	return false, false
+	return verifyEd25519License(key, ed25519PubKeyHex)
 }
 
 func verifyEd25519License(token, pubHex string) bool {
@@ -600,69 +459,63 @@ func verifyEd25519License(token, pubHex string) bool {
 	if err != nil || len(sigBytes) != ed25519.SignatureSize {
 		return false
 	}
-	return ed25519.Verify(ed25519.PublicKey(pubBytes), []byte("HWPRO1."+parts[1]), sigBytes)
+	message := []byte("HWPRO1." + parts[1])
+	return ed25519.Verify(ed25519.PublicKey(pubBytes), message, sigBytes)
 }
 
-func runProAutomation(failingNodes []nodeHealthReport, autoCordon, autoDrain bool, webhook, licenseKey string, simulateMode bool) error {
-	fmt.Println()
-	valid, dryRunFromLicense := verifyLicense(licenseKey, simulateMode)
-	if !valid {
-		if licenseKey == "PRO-DEMO-2026" && !simulateMode {
-			return errors.New("demo key PRO-DEMO-2026 is restricted to --simulate-raid-fail dry-run mode; use an Ed25519 production key (HWPRO1.<ID>.<SIG>) for live cluster remediation")
+func runProAutomation(failingNodes []nodeHealthReport, autoCordon, autoDrain bool, webhook, licenseKey, kubeContext string, simulateMode bool) error {
+	if autoCordon && autoDrain {
+		return errors.New("choose either auto-cordon or auto-drain")
+	}
+	if strings.TrimSpace(kubeContext) == "" {
+		return errors.New("an explicit Kubernetes context is required for actions")
+	}
+	if simulateMode {
+		fmt.Printf("%s[DRY-RUN] Simulation is always non-mutating; no kubectl commands or webhook requests will be made.%s\n", colorYellow, colorReset)
+		for _, node := range failingNodes {
+			switch {
+			case autoDrain:
+				fmt.Printf("[DRY-RUN] Would drain verified local node %q (without deleting emptyDir data).\n", node.Name)
+			case autoCordon:
+				fmt.Printf("[DRY-RUN] Would cordon verified local node %q.\n", node.Name)
+			}
+			if webhook != "" {
+				fmt.Printf("[DRY-RUN] Would send a webhook alert for node %q; request suppressed.\n", node.Name)
+			}
 		}
-		return errors.New("automated node cordoning/draining and webhook alerts require a valid Ed25519 Pro license key (HWPRO1.<ID>.<SIG>)")
+		return nil
 	}
-
-	// Hard safety invariant: simulation mode NEVER executes live kubectl or webhook calls, even with a production key.
-	isDryRun := simulateMode || dryRunFromLicense
-
-	if isDryRun {
-		fmt.Printf("%s[PRO DRY-RUN] Simulation mode active — no live kubectl commands or webhooks will be executed.%s\n", colorYellow, colorReset)
-	} else {
-		fmt.Printf("%s[PRO VERIFIED] Ed25519 signature verified.%s\n", colorGreen, colorReset)
+	if !verifyLicense(licenseKey) {
+		return errors.New("live automated actions require a valid Ed25519-signed Pro key and a release build with its public key configured")
 	}
-
 	if len(failingNodes) == 0 {
-		fmt.Println("-> All inspected nodes are within healthy thresholds. No remediation needed.")
+		fmt.Println("No confirmed local hardware failure; no action needed.")
 		return nil
 	}
 
-	for _, n := range failingNodes {
+	for _, node := range failingNodes {
 		if autoDrain {
-			if isDryRun {
-				fmt.Printf("%s[DRY-RUN] Would execute: kubectl drain %s --ignore-daemonsets --delete-emptydir-data --timeout=60s%s\n", colorYellow, n.Name, colorReset)
-			} else {
-				fmt.Printf("%s[ACTION] Draining node '%s' (respecting PodDisruptionBudgets)...%s\n", colorRed, n.Name, colorReset)
-				cmd := exec.Command("kubectl", "drain", n.Name, "--ignore-daemonsets", "--delete-emptydir-data", "--timeout=60s")
-				if out, err := cmd.CombinedOutput(); err != nil {
-					return fmt.Errorf("kubectl drain failed on %s: %v (%s)", n.Name, err, strings.TrimSpace(string(out)))
-				}
+			fmt.Printf("[ACTION] Draining verified local node %q (60 second timeout).\n", node.Name)
+			ctx, cancel := context.WithTimeout(context.Background(), 75*time.Second)
+			cmd := exec.CommandContext(ctx, "kubectl", kubectlArgs(kubeContext, "drain", node.Name, "--ignore-daemonsets", "--timeout=60s")...)
+			out, err := cmd.CombinedOutput()
+			cancel()
+			if err != nil {
+				return fmt.Errorf("kubectl drain failed for %q: %w (%s)", node.Name, err, strings.TrimSpace(string(out)))
 			}
 		} else if autoCordon {
-			if isDryRun {
-				fmt.Printf("%s[DRY-RUN] Would execute: kubectl cordon %s%s\n", colorYellow, n.Name, colorReset)
-			} else {
-				fmt.Printf("%s[ACTION] Cordoning node '%s' to prevent new pod scheduling...%s\n", colorRed, n.Name, colorReset)
-				cmd := exec.Command("kubectl", "cordon", n.Name)
-				if out, err := cmd.CombinedOutput(); err != nil {
-					return fmt.Errorf("kubectl cordon failed on %s: %v (%s)", n.Name, err, strings.TrimSpace(string(out)))
-				}
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			cmd := exec.CommandContext(ctx, "kubectl", kubectlArgs(kubeContext, "cordon", node.Name)...)
+			out, err := cmd.CombinedOutput()
+			cancel()
+			if err != nil {
+				return fmt.Errorf("kubectl cordon failed for %q: %w (%s)", node.Name, err, strings.TrimSpace(string(out)))
 			}
 		}
-
 		if webhook != "" {
-			if _, err := validateWebhookURL(webhook); err != nil {
-				return err
-			}
-			msg := fmt.Sprintf("🚨 [kubectl-hwhealth] Node `%s` hardware alert! RAID: `%s` | Thermal: `%s` | Cordon: `%v` | Drain: `%v`",
-				n.Name, n.RaidSummary, n.TempDisplay, autoCordon || autoDrain, autoDrain)
-			if isDryRun {
-				fmt.Printf("%s[DRY-RUN] Would POST HTTPS alert to webhook: %s%s\n", colorYellow, msg, colorReset)
-			} else {
-				if err := sendWebhookAlert(webhook, msg); err != nil {
-					return fmt.Errorf("webhook delivery failed: %v", err)
-				}
-				fmt.Printf("%s[ALERT SENT] Verified 2xx webhook response for node '%s'.%s\n", colorGreen, n.Name, colorReset)
+			message := fmt.Sprintf("[kubectl-hwhealth] Node %q hardware alert. RAID: %s; thermal: %s; cordon: %v; drain: %v.", node.Name, node.RaidSummary, node.TempDisplay, autoCordon || autoDrain, autoDrain)
+			if err := sendWebhookAlert(webhook, message); err != nil {
+				return fmt.Errorf("webhook delivery failed: %w", err)
 			}
 		}
 	}
@@ -672,19 +525,26 @@ func runProAutomation(failingNodes []nodeHealthReport, autoCordon, autoDrain boo
 func validateWebhookURL(rawURL string) (*url.URL, error) {
 	u, err := url.Parse(strings.TrimSpace(rawURL))
 	if err != nil {
-		return nil, fmt.Errorf("malformed webhook URL: %v", err)
+		return nil, fmt.Errorf("malformed webhook URL: %w", err)
 	}
-	if u.Scheme != "https" {
-		return nil, errors.New("webhook URL must use https://")
+	if u.Scheme != "https" || u.User != nil || u.Fragment != "" || u.RawQuery != "" {
+		return nil, errors.New("webhook must be an HTTPS URL without user information, query, or fragment")
+	}
+	if port := u.Port(); port != "" && port != "443" {
+		return nil, errors.New("webhook URL must use port 443")
 	}
 	host := strings.ToLower(u.Hostname())
-	if host == "" || host == "localhost" || strings.HasSuffix(host, ".local") || strings.HasSuffix(host, ".internal") {
-		return nil, fmt.Errorf("disallowed webhook host %q", host)
-	}
-	if ip := net.ParseIP(host); ip != nil {
-		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsUnspecified() {
-			return nil, fmt.Errorf("webhook IP %s must not be loopback or private", ip.String())
+	switch host {
+	case "hooks.slack.com":
+		if !strings.HasPrefix(u.EscapedPath(), "/services/") {
+			return nil, errors.New("Slack webhook path must begin with /services/")
 		}
+	case "discord.com", "discordapp.com":
+		if !strings.HasPrefix(u.EscapedPath(), "/api/webhooks/") {
+			return nil, errors.New("Discord webhook path must begin with /api/webhooks/")
+		}
+	default:
+		return nil, fmt.Errorf("webhook host %q is not an approved Slack or Discord host", host)
 	}
 	return u, nil
 }
@@ -694,38 +554,87 @@ func sendWebhookAlert(rawURL, message string) error {
 	if err != nil {
 		return err
 	}
-	payload := map[string]string{
-		"text":    message,
-		"content": message,
+	var payload map[string]string
+	switch strings.ToLower(u.Hostname()) {
+	case "hooks.slack.com":
+		payload = map[string]string{"text": message}
+	default:
+		payload = map[string]string{"content": message}
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
-
 	client := &http.Client{
 		Timeout: 5 * time.Second,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		Transport: &http.Transport{
+			Proxy:                 nil,
+			DialContext:           dialApprovedWebhookHost,
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          2,
+			IdleConnTimeout:       30 * time.Second,
+			TLSHandshakeTimeout:   5 * time.Second,
+			ResponseHeaderTimeout: 5 * time.Second,
+		},
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
 	}
-
-	req, err := http.NewRequest(http.MethodPost, u.String(), bytes.NewBuffer(body))
+	req, err := http.NewRequest(http.MethodPost, u.String(), bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "kubectl-hwhealth/0.2.0")
-
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
-
 	respBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("webhook returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(respBytes)))
 	}
 	return nil
+}
+
+// Resolve approved webhook domains immediately before dialing, reject any
+// private/special-use answer, then connect to the validated IP directly. This
+// avoids accepting arbitrary URLs and reduces DNS-rebinding/SSRF exposure.
+func dialApprovedWebhookHost(ctx context.Context, network, address string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, err
+	}
+	host = strings.ToLower(host)
+	if host != "hooks.slack.com" && host != "discord.com" && host != "discordapp.com" {
+		return nil, fmt.Errorf("unapproved webhook host %q", host)
+	}
+	resolved, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, fmt.Errorf("resolve webhook host %q: %w", host, err)
+	}
+	if len(resolved) == 0 {
+		return nil, fmt.Errorf("webhook host %q resolved to no addresses", host)
+	}
+	for _, candidate := range resolved {
+		if unsafeWebhookIP(candidate.IP) {
+			return nil, fmt.Errorf("webhook host %q resolved to a private or special-use address", host)
+		}
+	}
+	dialer := &net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
+	var lastErr error
+	for _, candidate := range resolved {
+		conn, dialErr := dialer.DialContext(ctx, network, net.JoinHostPort(candidate.IP.String(), port))
+		if dialErr == nil {
+			return conn, nil
+		}
+		lastErr = dialErr
+	}
+	return nil, fmt.Errorf("connect to approved webhook host %q: %w", host, lastErr)
+}
+
+func unsafeWebhookIP(ip net.IP) bool {
+	return ip == nil || ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast()
 }
