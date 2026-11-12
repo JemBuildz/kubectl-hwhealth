@@ -2,8 +2,6 @@
   <img src="assets/banner.jpg" alt="kubectl-hwhealth banner" width="750">
 </p>
 
-# kubectl-hwhealth 🛡️
-
 **Catch failing bare-metal RAID drives and overheating nodes before Kubernetes loses your data.**
 
 Standard Kubernetes (`kubelet`) schedules workloads based on CPU and RAM requests. It has no built-in awareness when a Linux software RAID array (`mdadm`) drops a member drive into degraded `[U_]` state or a bare-metal node begins thermally throttling.
