@@ -96,4 +96,4 @@ jobs:
           TAG_NAME: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
-          gh release upload "$TAG_NAME" release-assets/* --clobber
+          gh release upload "$TAG_NAME" release-assets/* --repo "$GITHUB_REPOSITORY" --clobber

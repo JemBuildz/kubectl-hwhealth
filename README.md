@@ -1,3 +1,5 @@
+![kubectl-hwhealth banner](assets/kubectl-hwhealth-horizontal-banner.webp)
+
 # kubectl-hwhealth
 
 A small Go `kubectl` plugin that checks Linux software RAID status from `/proc/mdstat` and CPU/package temperatures from `/sys/class/thermal` on the machine where it runs.
